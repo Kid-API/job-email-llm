@@ -136,7 +136,7 @@ Only output the JSON object.
 blacklist_keywords = load_blacklist()
 
 def contains_blacklist_keywords(mail):
-    text = (mail['subject'] + ' ' + mail['body']).lower()
+    text = (mail['subject'] + ' ' + mail['from']).lower()
     return any(word in text for word in blacklist_keywords)
 
 def process_email(mail, idx):
@@ -176,7 +176,7 @@ def main():
 
     output_rows = []
     start_all = time.time()
-    with ThreadPoolExecutor(max_workers=4) as executor:  # 24GB RAM = safe for 4!
+    with ThreadPoolExecutor(max_workers=6) as executor:  # 24GB RAM = safe for 4!
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
