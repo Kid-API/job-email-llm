@@ -39,7 +39,7 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=100):
+def get_job_emails(service, query=None, max_total=1000):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/01/01"
     emails = []
@@ -215,4 +215,7 @@ def main():
     print("All emails processed! Results saved to parsed_job_apps.csv")
 
 if __name__ == "__main__":
-    main()
+    while True:
+        main()
+        print("Waiting 5 minutes before next batch...")
+        time.sleep(300)  # Sleep for 300 seconds (5 minutes)
