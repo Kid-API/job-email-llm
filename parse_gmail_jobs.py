@@ -153,6 +153,17 @@ def process_email(mail, idx):
 
 def main():
     service = authenticate_gmail()
+    last_id = None
+    if os.path.exists("last_processed_id.txt"):
+        with open("last_processed_id.txt", "r") as f:
+            last_id = f.read().strip()
+        if last_id:
+            print(f"Last processed email ID: {last_id}")
+        else:
+            print("last_processed_id.txt is empty, will process all emails.")
+    else:
+        print("No last_processed_id.txt found, will process all emails.")
+
     emails = get_job_emails(service, max_total=100)  # Increase as needed
 
     csv_file = "parsed_job_apps.csv"
@@ -166,6 +177,10 @@ def main():
 
     emails_to_process = []
     for idx, mail in enumerate(emails, 1):
+        # STOP if we hit the last processed ID
+        if mail['id'] == last_id:
+            print("Reached last processed email. Stopping.")
+            break
         if mail['id'] in existing_ids:
             print(f"Skipping duplicate email with ID {mail['id']}")
             continue
@@ -176,7 +191,7 @@ def main():
 
     output_rows = []
     start_all = time.time()
-    with ThreadPoolExecutor(max_workers=6) as executor:  # 24GB RAM = safe for 4!
+    with ThreadPoolExecutor(max_workers=8) as executor:  # 24GB RAM = safe for 4!
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
@@ -213,6 +228,14 @@ def main():
         writer.writeheader()
         writer.writerows(output_rows)
     print("All emails processed! Results saved to parsed_job_apps.csv")
+        # Save the ID of the most recent (first) processed email
+    if output_rows:
+        newest_id = output_rows[0]['id']  # Assumes first is newest
+        with open("last_processed_id.txt", "w") as f:
+            f.write(newest_id)
+        print(f"Saved newest processed email ID: {newest_id}")
+    else:
+        print("No new emails processed, not updating last_processed_id.txt")
 
 if __name__ == "__main__":
     while True:
