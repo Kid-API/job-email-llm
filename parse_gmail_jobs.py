@@ -29,6 +29,16 @@ def authenticate_gmail():
             pickle.dump(creds, token)
     return build('gmail', 'v1', credentials=creds)
 
+def load_blacklist(filename="blacklist.txt"):
+    if not os.path.exists(filename):
+        print(f"Warning: {filename} not found. No blacklist will be applied.")
+        return []
+
+    with open(filename, "r") as f:
+        words = [line.strip().lower() for line in f if line.strip()]
+    return words
+
+
 def get_job_emails(service, query=None, max_total=100):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/01/01"
@@ -82,7 +92,7 @@ def extract_job_status_ollama(subject, body):
     prompt = f"""
 You are a filter and parser for job application emails.
 First, determine if this email is actually related to a *work/job application, interview, or job search communication*. 
-EXCLUDE emails related to: scholarships, comedy, rentals (including rental applications, apartment hunting, housing, lease, sublet), sales, therapy, promotions, roommate searches, or anything not directly about paid employment.
+EXCLUDE emails related to: scholarships, comedy, rentals (including rental applications, apartment hunting, housing, lease, sublet), therapy, promotions, roommate searches, or anything not directly about paid employment.
 Output a JSON object with:
 - relevant: true or false
 - reason: short explanation (e.g., 'job interview', 'rental application', 'not job-related')
@@ -105,7 +115,6 @@ Only output the JSON object.
         )
         response = result.stdout
 
-        # --- This is the ONLY JSON parsing code you need ---
         start = response.find('{')
         end = response.rfind('}') + 1
         json_text = response[start:end]
@@ -123,28 +132,8 @@ Only output the JSON object.
         print("Warning: Could not parse JSON from LLM output:", str(e))
         return {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": "Parsing failed"}
 
-
-start = response.find('{')
-end = response.rfind('}') + 1
-json_text = response[start:end]
-
-try:
-    data = json.loads(json_text)
-except Exception as e:
-    print("Warning: Couldn't parse JSON! This is what Ollama sent back:")
-    print(response)
-    data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
-
-        print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
-        json_start = result.stdout.find('{')
-        json_end = result.stdout.rfind('}') + 1
-        data = json.loads(result.stdout[json_start:json_end])
-        return data
-    except Exception as e:
-        print("Warning: Could not parse JSON from LLM output:", result.stdout)
-        return {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": "Parsing failed"}
-
-blacklist_keywords = ['match', 'matches', 'alerts', 'viewed', 'updates', 'canceled', 'reminder']
+# Blacklist for obvious non-job junk
+blacklist_keywords = load_blacklist()
 
 def contains_blacklist_keywords(mail):
     text = (mail['subject'] + ' ' + mail['body']).lower()
@@ -156,11 +145,15 @@ def process_email(mail, idx):
         return (idx, mail, llm_result)
     except Exception as e:
         print(f"LLM error for email {idx}: {e}")
-        return (idx, mail, {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": str(e), "error": str(e)})
+        return (idx, mail, {
+            "company": "", "job_title": "", "status": "",
+            "date": "", "relevant": False,
+            "reason": str(e), "error": str(e)
+        })
 
 def main():
     service = authenticate_gmail()
-    emails = get_job_emails(service, max_total=100)  # Bump up as needed
+    emails = get_job_emails(service, max_total=100)  # Increase as needed
 
     csv_file = "parsed_job_apps.csv"
     existing_ids = set()
@@ -211,7 +204,11 @@ def main():
 
     # Write all results to CSV
     with open(csv_file, "w", newline='') as csvfile:
-        fieldnames = ["id", "email_num", "subject", "from", "date_email", "company", "job_title", "status", "parsed_date", "reason", "error"]
+        fieldnames = [
+            "id", "email_num", "subject", "from", "date_email",
+            "company", "job_title", "status", "parsed_date",
+            "reason", "error"
+        ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(output_rows)
