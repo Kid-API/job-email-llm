@@ -1,0 +1,4 @@
+token.pickle
+credentials.json
+parsed_job_apps.csv
+__pycache__/
