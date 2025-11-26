@@ -78,29 +78,63 @@ def get_job_emails(service, query=None, max_total=100):
             break
     return emails
 
-def extract_job_status_ollama(email_text):
+def extract_job_status_ollama(subject, body):
     prompt = f"""
-    You are a filter and parser for job application emails.
-    First, determine if this email is actually related to a *work/job application, interview, or job search communication*. 
-    EXCLUDE emails related to: scholarships, comedy, rentals (including rental applications, apartment hunting, housing, lease, sublet), sales, therapy, promotions, roommate searches, or anything not directly about paid employment.
-    Output a JSON object with:
-    - relevant: true or false
-    - reason: short explanation (e.g., 'job interview', 'rental application', 'not job-related')
-    - company: (if relevant)
-    - job_title: (if relevant)
-    - status: (applied/interview/offer/rejection/other, if relevant)
-    - date: (if relevant)
-    If the email is not job-related, set relevant to false and leave the rest blank.
-    Email:
-    {email_text}
-    Only output the JSON object.
-    """
+You are a filter and parser for job application emails.
+First, determine if this email is actually related to a *work/job application, interview, or job search communication*. 
+EXCLUDE emails related to: scholarships, comedy, rentals (including rental applications, apartment hunting, housing, lease, sublet), sales, therapy, promotions, roommate searches, or anything not directly about paid employment.
+Output a JSON object with:
+- relevant: true or false
+- reason: short explanation (e.g., 'job interview', 'rental application', 'not job-related')
+- company: (if relevant)
+- job_title: (if relevant)
+- status: (applied/interview/offer/rejection/other, if relevant)
+- date: (if relevant)
+If the email is not job-related, set relevant to false and leave the rest blank.
+
+Email subject: {subject}
+Email body: {body}
+
+Only output the JSON object.
+"""
     try:
         llm_start = time.time()
         result = subprocess.run(
             ['ollama', 'run', 'llama3', prompt],
             capture_output=True, text=True
         )
+        response = result.stdout
+
+        # --- This is the ONLY JSON parsing code you need ---
+        start = response.find('{')
+        end = response.rfind('}') + 1
+        json_text = response[start:end]
+
+        try:
+            data = json.loads(json_text)
+        except Exception as e:
+            print("Warning: Couldn't parse JSON! This is what Ollama sent back:")
+            print(response)
+            data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
+
+        print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
+        return data
+    except Exception as e:
+        print("Warning: Could not parse JSON from LLM output:", str(e))
+        return {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": "Parsing failed"}
+
+
+start = response.find('{')
+end = response.rfind('}') + 1
+json_text = response[start:end]
+
+try:
+    data = json.loads(json_text)
+except Exception as e:
+    print("Warning: Couldn't parse JSON! This is what Ollama sent back:")
+    print(response)
+    data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
+
         print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
         json_start = result.stdout.find('{')
         json_end = result.stdout.rfind('}') + 1
@@ -118,7 +152,7 @@ def contains_blacklist_keywords(mail):
 
 def process_email(mail, idx):
     try:
-        llm_result = extract_job_status_ollama(mail['body'])
+        llm_result = extract_job_status_ollama(mail['subject'], mail['body'])
         return (idx, mail, llm_result)
     except Exception as e:
         print(f"LLM error for email {idx}: {e}")
