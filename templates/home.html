@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <h1>Job Applications</h1>
+
+    <form method="get">
+      <label>Status filter (e.g., applied, interview, offer, rejection):</label>
+      <input name="status" value="{{ status }}">
+      <button type="submit">Filter</button>
+    </form>
+
+    <h3>Counts by status</h3>
+    <ul>
+      {% for row in counts %}
+        <li>{{ row["status"] or "unknown" }}: {{ row["count"] }}</li>
+      {% endfor %}
+    </ul>
+
+    <h3>Latest emails</h3>
+    <table border="1" cellpadding="4">
+      <tr><th>Company</th><th>Job Title</th><th>Status</th><th>Email Date</th></tr>
+      {% for row in rows %}
+        <tr>
+          <td>{{ row["company"] }}</td>
+          <td>{{ row["job_title"] }}</td>
+          <td>{{ row["status"] }}</td>
+          <td>{{ row["date_email"] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  </body>
+</html>
