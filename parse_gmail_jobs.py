@@ -7,6 +7,7 @@ import threading
 import subprocess
 import json
 import time
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -20,6 +21,12 @@ _db_lock = threading.Lock()
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    ensure_schema(conn)
+    return conn
+
+
+def ensure_schema(conn):
+    """Create table and add missing columns if needed."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS emails (
@@ -28,6 +35,7 @@ def get_conn():
             subject TEXT,
             sender TEXT,
             date_email TEXT,
+            date_email_iso TEXT,
             company TEXT,
             job_title TEXT,
             status TEXT,
@@ -38,7 +46,10 @@ def get_conn():
         )
         """
     )
-    return conn
+    # Add date_email_iso if the table already existed
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
+    if "date_email_iso" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN date_email_iso TEXT")
 
 
 def save_rows(conn, rows):
@@ -63,13 +74,14 @@ def save_rows(conn, rows):
         conn.executemany(
             """
             INSERT INTO emails
-            (id, email_num, subject, sender, date_email,
+            (id, email_num, subject, sender, date_email, date_email_iso,
              company, job_title, status, parsed_date, reason, error)
-            VALUES (:id, :email_num, :subject, :from, :date_email,
+            VALUES (:id, :email_num, :subject, :from, :date_email, :date_email_iso,
                     :company, :job_title, :status, :parsed_date, :reason, :error)
             ON CONFLICT(id) DO UPDATE SET
                 subject=excluded.subject,
                 sender=excluded.sender,
+                date_email_iso=excluded.date_email_iso,
                 company=excluded.company,
                 job_title=excluded.job_title,
                 status=excluded.status,
@@ -210,6 +222,21 @@ def contains_blacklist_keywords(mail):
     text = (mail['subject'] + ' ' + mail['from']).lower()
     return any(word in text for word in blacklist_keywords)
 
+
+def to_iso_date(date_str):
+    """Convert email date header to ISO string for sorting."""
+    try:
+        dt = parsedate_to_datetime(date_str)
+        if dt is None:
+            return ""
+        # Normalize to naive UTC ISO for consistent sorting
+        if dt.tzinfo:
+            dt = dt.astimezone(tz=None)
+        return dt.isoformat()
+    except Exception:
+        return ""
+
+
 def process_email(mail, idx):
     try:
         llm_result = extract_job_status_ollama(mail['subject'], mail['body'])
@@ -226,7 +253,7 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=100)  # Increase as needed
+    emails = get_job_emails(service, max_total=500)  # Increase as needed
 
     csv_file = "parsed_job_apps.csv"
     existing_ids = set()
@@ -262,6 +289,7 @@ def main():
                 "subject": mail['subject'],
                 "from": mail['from'],
                 "date_email": mail['date'],
+                "date_email_iso": to_iso_date(mail['date']),
                 "company": llm_result.get("company", ""),
                 "job_title": llm_result.get("job_title", ""),
                 "status": llm_result.get("status", ""),
@@ -285,6 +313,7 @@ def main():
     with open(csv_file, "w", newline='') as csvfile:
         fieldnames = [
             "id", "email_num", "subject", "from", "date_email",
+            "date_email_iso",
             "company", "job_title", "status", "parsed_date",
             "reason", "error"
         ]
