@@ -2,6 +2,8 @@ import os
 import pickle
 import base64
 import csv
+import sqlite3
+import threading
 import subprocess
 import json
 import time
@@ -9,6 +11,75 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+
+# Paths and database setup
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "jobs.db")
+_db_lock = threading.Lock()
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS emails (
+            id TEXT PRIMARY KEY,
+            email_num INTEGER,
+            subject TEXT,
+            sender TEXT,
+            date_email TEXT,
+            company TEXT,
+            job_title TEXT,
+            status TEXT,
+            parsed_date TEXT,
+            reason TEXT,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    return conn
+
+
+def save_rows(conn, rows):
+    """Save parsed rows into SQLite, updating existing IDs."""
+    if not rows:
+        return
+
+    def _clean(value):
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return "; ".join(str(v) for v in value)
+        if isinstance(value, dict):
+            return json.dumps(value)
+        return value
+
+    cleaned = []
+    for row in rows:
+        cleaned.append({k: _clean(v) for k, v in row.items()})
+
+    with _db_lock, conn:
+        conn.executemany(
+            """
+            INSERT INTO emails
+            (id, email_num, subject, sender, date_email,
+             company, job_title, status, parsed_date, reason, error)
+            VALUES (:id, :email_num, :subject, :from, :date_email,
+                    :company, :job_title, :status, :parsed_date, :reason, :error)
+            ON CONFLICT(id) DO UPDATE SET
+                subject=excluded.subject,
+                sender=excluded.sender,
+                company=excluded.company,
+                job_title=excluded.job_title,
+                status=excluded.status,
+                parsed_date=excluded.parsed_date,
+                reason=excluded.reason,
+                error=excluded.error
+            """,
+            cleaned,
+        )
+
 
 # Gmail API setup
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -153,16 +224,7 @@ def process_email(mail, idx):
 
 def main():
     service = authenticate_gmail()
-    last_id = None
-    if os.path.exists("last_processed_id.txt"):
-        with open("last_processed_id.txt", "r") as f:
-            last_id = f.read().strip()
-        if last_id:
-            print(f"Last processed email ID: {last_id}")
-        else:
-            print("last_processed_id.txt is empty, will process all emails.")
-    else:
-        print("No last_processed_id.txt found, will process all emails.")
+    conn = get_conn()
 
     emails = get_job_emails(service, max_total=100)  # Increase as needed
 
@@ -177,10 +239,6 @@ def main():
 
     emails_to_process = []
     for idx, mail in enumerate(emails, 1):
-        # STOP if we hit the last processed ID
-        if mail['id'] == last_id:
-            print("Reached last processed email. Stopping.")
-            break
         if mail['id'] in existing_ids:
             print(f"Skipping duplicate email with ID {mail['id']}")
             continue
@@ -217,6 +275,12 @@ def main():
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
 
+    if output_rows:
+        save_rows(conn, output_rows)
+        print(f"Saved {len(output_rows)} rows into {DB_PATH}")
+    else:
+        print("No new rows to save to the database.")
+
     # Write all results to CSV
     with open(csv_file, "w", newline='') as csvfile:
         fieldnames = [
@@ -228,17 +292,13 @@ def main():
         writer.writeheader()
         writer.writerows(output_rows)
     print("All emails processed! Results saved to parsed_job_apps.csv")
-        # Save the ID of the most recent (first) processed email
     if output_rows:
-        newest_id = output_rows[0]['id']  # Assumes first is newest
-        with open("last_processed_id.txt", "w") as f:
-            f.write(newest_id)
-        print(f"Saved newest processed email ID: {newest_id}")
+        print(f"Processed {len(output_rows)} emails this run.")
     else:
-        print("No new emails processed, not updating last_processed_id.txt")
+        print("No new emails processed this run.")
 
 if __name__ == "__main__":
     while True:
         main()
         print("Waiting 5 minutes before next batch...")
-        time.sleep(300)  # Sleep for 300 seconds (5 minutes)
+        time.sleep(200)  # Sleep for 200 seconds (5 minutes)
