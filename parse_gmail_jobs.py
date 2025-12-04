@@ -224,11 +224,16 @@ def main():
     with ThreadPoolExecutor(max_workers=8) as executor:  # 8 parallel LLM calls
         future_to_idx = {executor.submit(process_email, mail, idx, blacklist_keywords): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
-            row = future.result()
+            idx = future_to_idx[future]
+            try:
+                row = future.result()
+            except Exception as e:
+                print(f"Error processing email {idx}: {e!r}")
+                continue
+        
             if row is not None:
                 output_rows.append(row)
                 existing_ids.add(row['id'])
-            idx = future_to_idx[future]
             print(f"Processed email {idx} of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
     print("CWD:", os.getcwd())
