@@ -25,6 +25,7 @@ def ensure_tables(conn):
             subject TEXT,
             sender TEXT,
             date_email TEXT,
+            date_email_iso TEXT,
             company TEXT,
             job_title TEXT,
             status TEXT,
@@ -35,6 +36,9 @@ def ensure_tables(conn):
         )
         """
     )
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
+    if "date_email_iso" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN date_email_iso TEXT")
 
 
 @app.route("/")
@@ -43,9 +47,9 @@ def home():
     where = "WHERE status = ?" if status else ""
     params = (status,) if status else ()
     rows = query(
-        f"""SELECT company, job_title, status, date_email
+        f"""SELECT company, job_title, status, date_email, date_email_iso
             FROM emails {where}
-            ORDER BY date_email DESC""",
+            ORDER BY date_email_iso DESC""",
         params,
     )
     counts = query("SELECT status, COUNT(*) AS count FROM emails GROUP BY status")

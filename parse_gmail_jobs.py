@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
+from status_utils import clean_status
 
 # Paths and database setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +24,13 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     ensure_schema(conn)
     return conn
+
+
+def load_existing_ids(conn):
+    """Return a set of IDs already stored in the database."""
+    ensure_schema(conn)
+    rows = conn.execute("SELECT id FROM emails").fetchall()
+    return {r[0] for r in rows}
 
 
 def ensure_schema(conn):
@@ -124,7 +132,7 @@ def load_blacklist(filename="blacklist.txt"):
 
 def get_job_emails(service, query=None, max_total=1000):
     if not query:
-        query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/01/01"
+        query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2023/01/01"
     emails = []
     next_page_token = None
     fetched = 0
@@ -253,35 +261,31 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=500)  # Increase as needed
+    emails = get_job_emails(service, max_total=1000)  # Increase as needed
 
-    csv_file = "parsed_job_apps.csv"
-    existing_ids = set()
-    if os.path.exists(csv_file):
-        with open(csv_file, newline='') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if 'id' in row:
-                    existing_ids.add(row['id'])
+    existing_ids = load_existing_ids(conn)
 
     emails_to_process = []
+    skipped_dupe = 0
+    skipped_blacklist = 0
     for idx, mail in enumerate(emails, 1):
         if mail['id'] in existing_ids:
-            print(f"Skipping duplicate email with ID {mail['id']}")
+            skipped_dupe += 1
             continue
         if contains_blacklist_keywords(mail):
-            print(f"Skipping email with blacklisted word: {mail['subject']}")
+            skipped_blacklist += 1
             continue
         emails_to_process.append((mail, idx))
 
     output_rows = []
     start_all = time.time()
+    skipped_not_relevant = 0
     with ThreadPoolExecutor(max_workers=8) as executor:  # 24GB RAM = safe for 4!
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
             if not llm_result.get("relevant", True):
-                print(f"Skipping non-job email (reason: {llm_result.get('reason', '')})")
+                skipped_not_relevant += 1
                 continue
             row = {
                 "id": mail['id'],
@@ -292,7 +296,7 @@ def main():
                 "date_email_iso": to_iso_date(mail['date']),
                 "company": llm_result.get("company", ""),
                 "job_title": llm_result.get("job_title", ""),
-                "status": llm_result.get("status", ""),
+                "status": clean_status(llm_result.get("status", "")),
                 "parsed_date": llm_result.get("date", ""),
                 "reason": llm_result.get("reason", ""),
                 "error": llm_result.get("error", "")
@@ -308,6 +312,14 @@ def main():
         print(f"Saved {len(output_rows)} rows into {DB_PATH}")
     else:
         print("No new rows to save to the database.")
+
+    print(
+        f"Run summary: fetched {len(emails)}; "
+        f"dupes skipped {skipped_dupe}; "
+        f"blacklist skipped {skipped_blacklist}; "
+        f"LLM skipped {skipped_not_relevant}; "
+        f"saved {len(output_rows)}"
+    )
 
     # Write all results to CSV
     with open(csv_file, "w", newline='') as csvfile:
