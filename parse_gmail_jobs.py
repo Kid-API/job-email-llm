@@ -389,7 +389,7 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=50)  # Lowered for testing; increase as needed
+    emails = get_job_emails(service, max_total=300)
 
     existing_ids = load_existing_ids(conn)
 
