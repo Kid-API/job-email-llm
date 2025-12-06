@@ -1,6 +1,8 @@
 from flask import Flask, render_template, request
 import os
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "jobs.db")
@@ -70,6 +72,8 @@ def home():
     raw_exclude = request.args.get("exclude", "")
     exclude_statuses = [s.strip() for s in raw_exclude.split(",") if s.strip()]
     hide_unknown = request.args.get("hide_unknown", "") in ("1", "true", "yes", "on")
+    start_date_raw = request.args.get("start_date", "").strip()
+    end_date_raw = request.args.get("end_date", "").strip()
     sort = request.args.get("sort", "date")
     try:
         page = max(1, int(request.args.get("page", "1")))
@@ -84,6 +88,7 @@ def home():
     status_expr = "COALESCE(NULLIF(a.status, ''), 'unknown')"
     company_expr = "COALESCE(NULLIF(TRIM(a.company), ''), 'unknown')"
     title_expr = "COALESCE(NULLIF(TRIM(a.job_title), ''), 'unknown')"
+    date_expr = "substr(e.date_email_iso, 1, 10)"
 
     # Always ignore rows where both company and title are blank/unknown.
     base_filter = f"NOT ({company_expr} = 'unknown' AND {title_expr} = 'unknown')"
@@ -99,6 +104,22 @@ def home():
         params.extend(exclude_statuses)
     if hide_unknown:
         where_clauses.append(f"{status_expr} <> 'unknown'")
+
+    # Optional date range filters (expect YYYY-MM-DD)
+    def valid_date(val: str) -> bool:
+        try:
+            # Accept plain date strings
+            datetime.fromisoformat(val)
+            return True
+        except Exception:
+            return False
+
+    if start_date_raw and valid_date(start_date_raw):
+        where_clauses.append(f"{date_expr} >= ?")
+        params.append(start_date_raw)
+    if end_date_raw and valid_date(end_date_raw):
+        where_clauses.append(f"{date_expr} <= ?")
+        params.append(end_date_raw)
 
     where = "WHERE " + " AND ".join(where_clauses)
 
@@ -128,6 +149,29 @@ def home():
             LIMIT ? OFFSET ?""",
         tuple(params) + (page_size, offset),
     )
+    def format_est(iso_str: str) -> str:
+        if not iso_str:
+            return ""
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            est = dt.astimezone(ZoneInfo("America/New_York"))
+            return est.strftime("%Y-%m-%d %I:%M %p ET")
+        except Exception:
+            return iso_str
+
+    rows = [
+        {
+            "company": r["company"],
+            "job_title": r["job_title"],
+            "status": r["status"],
+            "date_email": r["date_email"],
+            "date_email_iso": r["date_email_iso"],
+            "date_display": format_est(r["date_email_iso"]),
+        }
+        for r in rows
+    ]
     counts = query(
         f"""
         SELECT COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*) AS count
@@ -146,6 +190,8 @@ def home():
         status=status,
         exclude=raw_exclude,
         hide_unknown=hide_unknown,
+        start_date=start_date_raw,
+        end_date=end_date_raw,
         sort=sort,
         page=page,
         page_size=page_size,
