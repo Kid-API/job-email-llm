@@ -22,6 +22,7 @@ _db_lock = threading.Lock()
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON;")
     ensure_schema(conn)
     return conn
 
@@ -34,7 +35,7 @@ def load_existing_ids(conn):
 
 
 def ensure_schema(conn):
-    """Create table and add missing columns if needed."""
+    """Create tables and add missing columns if needed."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS emails (
@@ -58,6 +59,29 @@ def ensure_schema(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
     if "date_email_iso" not in cols:
         conn.execute("ALTER TABLE emails ADD COLUMN date_email_iso TEXT")
+    # Applications table stores one row per job mention, linked back to emails
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id TEXT NOT NULL,
+            company TEXT,
+            job_title TEXT,
+            status TEXT,
+            parsed_date TEXT,
+            reason TEXT,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_applications_email_id ON applications(email_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)"
+    )
 
 
 def save_rows(conn, rows):
@@ -98,6 +122,33 @@ def save_rows(conn, rows):
                 error=excluded.error
             """,
             cleaned,
+        )
+        # Refresh applications for these emails to avoid duplicates
+        email_ids = [(row["id"],) for row in cleaned]
+        conn.executemany(
+            "DELETE FROM applications WHERE email_id = ?",
+            email_ids,
+        )
+        applications = []
+        for row in cleaned:
+            applications.append(
+                {
+                    "email_id": row["id"],
+                    "company": row.get("company", ""),
+                    "job_title": row.get("job_title", ""),
+                    "status": row.get("status", ""),
+                    "parsed_date": row.get("parsed_date", ""),
+                    "reason": row.get("reason", ""),
+                    "error": row.get("error", ""),
+                }
+            )
+        conn.executemany(
+            """
+            INSERT INTO applications
+            (email_id, company, job_title, status, parsed_date, reason, error)
+            VALUES (:email_id, :company, :job_title, :status, :parsed_date, :reason, :error)
+            """,
+            applications,
         )
 
 
@@ -213,8 +264,7 @@ Only output the JSON object.
         try:
             data = json.loads(json_text)
         except Exception as e:
-            print("Warning: Couldn't parse JSON! This is what Ollama sent back:")
-            print(response)
+            print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
             data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
 
         print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
@@ -229,6 +279,19 @@ blacklist_keywords = load_blacklist()
 def contains_blacklist_keywords(mail):
     text = (mail['subject'] + ' ' + mail['from']).lower()
     return any(word in text for word in blacklist_keywords)
+
+
+# Cheap local filter to avoid sending obvious non-job emails to the LLM
+job_like_keywords = [
+    "job", "application", "applied", "interview", "offer",
+    "position", "role", "career", "candidate", "hiring",
+    "recruit", "recruiter", "opening"
+]
+
+
+def looks_job_related(mail):
+    text = (mail.get("subject", "") + " " + mail.get("body", "")).lower()
+    return any(word in text for word in job_like_keywords)
 
 
 def to_iso_date(date_str):
@@ -268,12 +331,16 @@ def main():
     emails_to_process = []
     skipped_dupe = 0
     skipped_blacklist = 0
+    skipped_prefilter = 0
     for idx, mail in enumerate(emails, 1):
         if mail['id'] in existing_ids:
             skipped_dupe += 1
             continue
         if contains_blacklist_keywords(mail):
             skipped_blacklist += 1
+            continue
+        if not looks_job_related(mail):
+            skipped_prefilter += 1
             continue
         emails_to_process.append((mail, idx))
 
@@ -317,6 +384,7 @@ def main():
         f"Run summary: fetched {len(emails)}; "
         f"dupes skipped {skipped_dupe}; "
         f"blacklist skipped {skipped_blacklist}; "
+        f"prefilter skipped {skipped_prefilter}; "
         f"LLM skipped {skipped_not_relevant}; "
         f"saved {len(output_rows)}"
     )

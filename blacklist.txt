@@ -7,4 +7,5 @@ therapy
 canceled
 reminder
 similar
+Waiting List
 You’re almost there! Complete your application

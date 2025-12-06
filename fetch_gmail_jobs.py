@@ -78,7 +78,7 @@ def extract_job_status_ollama(email_text):
         data = json.loads(result.stdout[json_start:json_end])
         return data
     except Exception as e:
-        print("Warning: Could not parse JSON from LLM output:", result.stdout)
+        print("Warning: Could not parse JSON from LLM output (payload suppressed):", str(e))
         return {"company": "", "job_title": "", "status": "", "date": "", "error": "Parsing failed"}
 
 def main():
