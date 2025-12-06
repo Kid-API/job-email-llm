@@ -116,7 +116,7 @@ def home():
             {where}
             ORDER BY {order_by}
             LIMIT ? OFFSET ?""",
-        params + (page_size, offset),
+        tuple(params) + (page_size, offset),
     )
     counts = query(
         f"""
