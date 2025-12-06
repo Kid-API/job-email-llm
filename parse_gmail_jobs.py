@@ -163,13 +163,13 @@ def save_rows(conn, rows):
             for app in apps:
                 applications.append(
                     {
-                        "email_id": row["id"],
-                        "company": app.get("company", ""),
-                        "job_title": app.get("job_title", ""),
-                        "status": app.get("status", ""),
-                        "parsed_date": app.get("parsed_date", ""),
-                        "reason": app.get("reason", ""),
-                        "error": app.get("error", ""),
+                        "email_id": _clean(row["id"]),
+                        "company": _clean(app.get("company", "")),
+                        "job_title": _clean(app.get("job_title", "")),
+                        "status": _clean(app.get("status", "")),
+                        "parsed_date": _clean(app.get("parsed_date", "")),
+                        "reason": _clean(app.get("reason", "")),
+                        "error": _clean(app.get("error", "")),
                     }
                 )
         conn.executemany(
@@ -211,7 +211,7 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=500):
+def get_job_emails(service, query=None, max_total=50):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
@@ -386,7 +386,7 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=1000)  # Increase as needed
+    emails = get_job_emails(service, max_total=50)  # Lowered for testing; increase as needed
 
     existing_ids = load_existing_ids(conn)
 
@@ -395,9 +395,10 @@ def main():
     skipped_blacklist = 0
     skipped_prefilter = 0
     for idx, mail in enumerate(emails, 1):
-        if mail['id'] in existing_ids:
-            skipped_dupe += 1
-            continue
+        # Temporarily disable duplicate skip to reprocess all emails
+        # if mail['id'] in existing_ids:
+        #     skipped_dupe += 1
+        #     continue
         if contains_blacklist_keywords(mail):
             skipped_blacklist += 1
             continue
