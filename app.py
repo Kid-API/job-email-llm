@@ -12,11 +12,13 @@ def query(sql, params=()):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA foreign_keys = ON;")
         ensure_tables(conn)
         return conn.execute(sql, params).fetchall()
 
 
 def ensure_tables(conn):
+    """Create the emails/applications tables if they don't exist yet."""
     """Create the emails/applications tables if they don't exist yet."""
     conn.execute(
         """
@@ -26,6 +28,7 @@ def ensure_tables(conn):
             subject TEXT,
             sender TEXT,
             date_email TEXT,
+            date_email_iso TEXT,
             date_email_iso TEXT,
             company TEXT,
             job_title TEXT,
@@ -62,6 +65,31 @@ def ensure_tables(conn):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)"
     )
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
+    if "date_email_iso" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN date_email_iso TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS applications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id TEXT NOT NULL,
+            company TEXT,
+            job_title TEXT,
+            status TEXT,
+            parsed_date TEXT,
+            reason TEXT,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(email_id) REFERENCES emails(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_applications_email_id ON applications(email_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)"
+    )
 
 
 @app.route("/")
@@ -70,6 +98,17 @@ def home():
     status_expr = "COALESCE(NULLIF(a.status, ''), 'unknown')"
     where = f"WHERE {status_expr} = ?" if status else ""
     params = (status,) if status else ()
+
+    offset = (page - 1) * page_size
+
+    total_rows = query(
+        f"""SELECT COUNT(*) AS c
+            FROM applications a
+            JOIN emails e ON a.email_id = e.id
+            {where}""",
+        params,
+    )[0]["c"]
+
     rows = query(
         f"""SELECT a.company, a.job_title, {status_expr} AS status, e.date_email, e.date_email_iso
             FROM applications a

@@ -20,6 +20,20 @@ DB_PATH = os.path.join(BASE_DIR, "jobs.db")
 _db_lock = threading.Lock()
 
 
+def detect_platform(sender):
+    """Roughly tag known platforms from the sender address."""
+    s = (sender or "").lower()
+    if "linkedin.com" in s:
+        return "linkedin"
+    if "indeed.com" in s:
+        return "indeed"
+    if "greenhouse.io" in s:
+        return "greenhouse"
+    if "lever.co" in s:
+        return "lever"
+    return "other"
+
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -197,7 +211,7 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=1000):
+def get_job_emails(service, query=None, max_total=500):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
@@ -231,12 +245,19 @@ def get_job_emails(service, query=None, max_total=1000):
                     body = base64.urlsafe_b64decode(msg_detail['payload']['body']['data']).decode('utf-8')
             except Exception as e:
                 body = "(Unable to decode email body)"
+            platform = detect_platform(sender)
+            subject_trimmed = (subject or "")[:250]
+            # Keep body short for privacy/cost; LinkedIn often puts the key info up top
+            body_snippet = (body or "")[:1200]
             emails.append({
                 'id': msg['id'],
                 'subject': subject,
+                'subject_trimmed': subject_trimmed,
                 'from': sender,
                 'date': date,
-                'body': body
+                'body': body,
+                'body_snippet': body_snippet,
+                'platform': platform,
             })
             fetched += 1
             if fetched >= max_total:
@@ -246,11 +267,13 @@ def get_job_emails(service, query=None, max_total=1000):
             break
     return emails
 
-def extract_job_status_ollama(subject, body):
+def extract_job_status_ollama(subject, body_snippet, platform):
     prompt = f"""
 You are a filter and parser for job application emails.
 First, decide if this email is about a job (application, interview, offer, rejection, recruiter outreach, etc.).
 Exclude non-job topics (scholarships, rentals, therapy, promotions, roommate searches, etc.).
+Prefer the subject for company/role if it looks clear; use the body snippet only if the subject is unclear.
+Platform hint: {platform}.
 Return JSON with:
 {{
   "relevant": true/false,
@@ -267,8 +290,8 @@ Return JSON with:
 }}
 If not job-related, set relevant=false and jobs=[].
 
-Email subject: {subject}
-Email body: {body}
+Email subject (trimmed): {subject}
+Email body snippet (trimmed): {body_snippet}
 
 Only output the JSON object.
 """
@@ -278,6 +301,8 @@ Only output the JSON object.
             ['ollama', 'run', 'llama3', prompt],
             capture_output=True, text=True
         )
+        if result.returncode != 0:
+            print(f"Ollama error {result.returncode}: {result.stderr[:500]}")
         response = result.stdout
 
         start = response.find('{')
@@ -343,7 +368,11 @@ def to_iso_date(date_str):
 
 def process_email(mail, idx):
     try:
-        llm_result = extract_job_status_ollama(mail['subject'], mail['body'])
+        llm_result = extract_job_status_ollama(
+            mail.get('subject_trimmed', mail.get('subject', '')),
+            mail.get('body_snippet', mail.get('body', '')),
+            mail.get('platform', 'other'),
+        )
         return (idx, mail, llm_result)
     except Exception as e:
         print(f"LLM error for email {idx}: {e}")
@@ -380,7 +409,7 @@ def main():
     output_rows = []
     start_all = time.time()
     skipped_not_relevant = 0
-    with ThreadPoolExecutor(max_workers=8) as executor:  # 24GB RAM = safe for 4!
+    with ThreadPoolExecutor(max_workers=6) as executor:  # adjust concurrency
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
@@ -446,24 +475,6 @@ def main():
         f"LLM skipped {skipped_not_relevant}; "
         f"saved {len(output_rows)}"
     )
-
-    # Write all results to CSV
-    with open(csv_file, "w", newline='') as csvfile:
-        fieldnames = [
-            "id", "email_num", "subject", "from", "date_email",
-            "date_email_iso",
-            "company", "job_title", "status", "parsed_date",
-            "reason", "error"
-        ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(output_rows)
-    print("All emails processed! Results saved to parsed_job_apps.csv")
-    if output_rows:
-        print(f"Processed {len(output_rows)} emails this run.")
-    else:
-        print("No new emails processed this run.")
-
 if __name__ == "__main__":
     while True:
         main()
