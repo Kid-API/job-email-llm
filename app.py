@@ -67,10 +67,11 @@ def ensure_tables(conn):
 @app.route("/")
 def home():
     status = request.args.get("status", "").strip()
-    where = "WHERE a.status = ?" if status else ""
+    status_expr = "COALESCE(NULLIF(a.status, ''), 'unknown')"
+    where = f"WHERE {status_expr} = ?" if status else ""
     params = (status,) if status else ()
     rows = query(
-        f"""SELECT a.company, a.job_title, a.status, e.date_email, e.date_email_iso
+        f"""SELECT a.company, a.job_title, {status_expr} AS status, e.date_email, e.date_email_iso
             FROM applications a
             JOIN emails e ON a.email_id = e.id
             {where}
@@ -78,7 +79,8 @@ def home():
         params,
     )
     counts = query(
-        "SELECT status, COUNT(*) AS count FROM applications GROUP BY status"
+        "SELECT COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*) AS count "
+        "FROM applications GROUP BY 1"
     )
     return render_template("home.html", rows=rows, counts=counts, status=status)
 

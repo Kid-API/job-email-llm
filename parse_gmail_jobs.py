@@ -99,8 +99,11 @@ def save_rows(conn, rows):
         return value
 
     cleaned = []
+    applications_by_email = {}
     for row in rows:
-        cleaned.append({k: _clean(v) for k, v in row.items()})
+        applications_by_email[row["id"]] = row.get("applications", [])
+        cleaned_row = {k: _clean(v) for k, v in row.items() if k != "applications"}
+        cleaned.append(cleaned_row)
 
     with _db_lock, conn:
         conn.executemany(
@@ -130,18 +133,31 @@ def save_rows(conn, rows):
             email_ids,
         )
         applications = []
-        for row in cleaned:
-            applications.append(
-                {
-                    "email_id": row["id"],
-                    "company": row.get("company", ""),
-                    "job_title": row.get("job_title", ""),
-                    "status": row.get("status", ""),
-                    "parsed_date": row.get("parsed_date", ""),
-                    "reason": row.get("reason", ""),
-                    "error": row.get("error", ""),
-                }
-            )
+        for row in rows:
+            apps = applications_by_email.get(row["id"], [])
+            if not apps:
+                apps = [
+                    {
+                        "company": row.get("company", ""),
+                        "job_title": row.get("job_title", ""),
+                        "status": row.get("status", ""),
+                        "parsed_date": row.get("parsed_date", ""),
+                        "reason": row.get("reason", ""),
+                        "error": row.get("error", ""),
+                    }
+                ]
+            for app in apps:
+                applications.append(
+                    {
+                        "email_id": row["id"],
+                        "company": app.get("company", ""),
+                        "job_title": app.get("job_title", ""),
+                        "status": app.get("status", ""),
+                        "parsed_date": app.get("parsed_date", ""),
+                        "reason": app.get("reason", ""),
+                        "error": app.get("error", ""),
+                    }
+                )
         conn.executemany(
             """
             INSERT INTO applications
@@ -183,7 +199,7 @@ def load_blacklist(filename="blacklist.txt"):
 
 def get_job_emails(service, query=None, max_total=1000):
     if not query:
-        query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2023/01/01"
+        query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
     next_page_token = None
     fetched = 0
@@ -233,16 +249,23 @@ def get_job_emails(service, query=None, max_total=1000):
 def extract_job_status_ollama(subject, body):
     prompt = f"""
 You are a filter and parser for job application emails.
-First, determine if this email is actually related to a *work/job application, interview, or job search communication*. 
-EXCLUDE emails related to: scholarships, comedy, rentals (including rental applications, apartment hunting, housing, lease, sublet), therapy, promotions, roommate searches, or anything not directly about paid employment.
-Output a JSON object with:
-- relevant: true or false
-- reason: short explanation (e.g., 'job interview', 'rental application', 'not job-related')
-- company: (if relevant)
-- job_title: (if relevant)
-- status: (applied/interview/offer/rejection/other, if relevant)
-- date: (if relevant)
-If the email is not job-related, set relevant to false and leave the rest blank.
+First, decide if this email is about a job (application, interview, offer, rejection, recruiter outreach, etc.).
+Exclude non-job topics (scholarships, rentals, therapy, promotions, roommate searches, etc.).
+Return JSON with:
+{{
+  "relevant": true/false,
+  "reason": "short note",
+  "jobs": [
+    {{
+      "company": "...",
+      "job_title": "...",
+      "status": "applied/interview/offer/rejected/unknown",
+      "date": "optional"
+    }}
+  ],
+  "error": ""
+}}
+If not job-related, set relevant=false and jobs=[].
 
 Email subject: {subject}
 Email body: {body}
@@ -265,13 +288,23 @@ Only output the JSON object.
             data = json.loads(json_text)
         except Exception as e:
             print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
-            data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
+            data = {
+                "relevant": False,
+                "reason": "Parsing failed",
+                "jobs": [],
+                "error": str(e),
+            }
 
         print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
         return data
     except Exception as e:
         print("Warning: Could not parse JSON from LLM output:", str(e))
-        return {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": "Parsing failed"}
+        return {
+            "relevant": False,
+            "reason": "Parsing failed",
+            "jobs": [],
+            "error": "Parsing failed",
+        }
 
 # Blacklist for obvious non-job junk
 blacklist_keywords = load_blacklist()
@@ -315,8 +348,8 @@ def process_email(mail, idx):
     except Exception as e:
         print(f"LLM error for email {idx}: {e}")
         return (idx, mail, {
-            "company": "", "job_title": "", "status": "",
-            "date": "", "relevant": False,
+            "jobs": [],
+            "relevant": False,
             "reason": str(e), "error": str(e)
         })
 
@@ -354,6 +387,29 @@ def main():
             if not llm_result.get("relevant", True):
                 skipped_not_relevant += 1
                 continue
+            jobs = llm_result.get("jobs", [])
+            if not isinstance(jobs, list):
+                jobs = []
+            # Backward-compat: if single fields came back, wrap them as one job
+            if not jobs and any(llm_result.get(k) for k in ("company", "job_title", "status")):
+                jobs = [{
+                    "company": llm_result.get("company", ""),
+                    "job_title": llm_result.get("job_title", ""),
+                    "status": llm_result.get("status", ""),
+                    "date": llm_result.get("date", ""),
+                }]
+            applications = []
+            for job in jobs:
+                applications.append(
+                    {
+                        "company": job.get("company", ""),
+                        "job_title": job.get("job_title", ""),
+                        "status": clean_status(job.get("status", "")),
+                        "parsed_date": job.get("date", ""),
+                        "reason": llm_result.get("reason", ""),
+                        "error": llm_result.get("error", ""),
+                    }
+                )
             row = {
                 "id": mail['id'],
                 "email_num": idx,
@@ -361,12 +417,14 @@ def main():
                 "from": mail['from'],
                 "date_email": mail['date'],
                 "date_email_iso": to_iso_date(mail['date']),
-                "company": llm_result.get("company", ""),
-                "job_title": llm_result.get("job_title", ""),
-                "status": clean_status(llm_result.get("status", "")),
-                "parsed_date": llm_result.get("date", ""),
+                # Keep first job on the email row for compatibility; applications table is canonical
+                "company": applications[0]["company"] if applications else "",
+                "job_title": applications[0]["job_title"] if applications else "",
+                "status": applications[0]["status"] if applications else "",
+                "parsed_date": applications[0]["parsed_date"] if applications else "",
                 "reason": llm_result.get("reason", ""),
-                "error": llm_result.get("error", "")
+                "error": llm_result.get("error", ""),
+                "applications": applications,
             }
             output_rows.append(row)
             existing_ids.add(mail['id'])
