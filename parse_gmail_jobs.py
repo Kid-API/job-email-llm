@@ -214,7 +214,7 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=300):
+def get_job_emails(service, query=None, max_total=2000):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
@@ -389,7 +389,7 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=300)
+    emails = get_job_emails(service, max_total=2000)
 
     existing_ids = load_existing_ids(conn)
 
