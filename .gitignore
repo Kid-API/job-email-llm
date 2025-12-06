@@ -4,3 +4,7 @@ parsed_job_apps.csv
 __pycache__/
 jobs.db
 venv/
+
+jobs.db
+jobs.db-wal
+jobs.db-shm

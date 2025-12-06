@@ -7,17 +7,20 @@ import threading
 import subprocess
 import json
 import time
+import sys
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-from status_utils import clean_status
 
 # Paths and database setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "jobs.db")
 _db_lock = threading.Lock()
+
+from status_utils import clean_status
 
 
 def detect_platform(sender):
