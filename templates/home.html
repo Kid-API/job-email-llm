@@ -6,6 +6,9 @@
     <form method="get">
       <label>Status filter (e.g., applied, interview, offer, rejection):</label>
       <input name="status" value="{{ status }}">
+      <label>Exclude statuses (comma-separated):</label>
+      <input name="exclude" value="{{ exclude }}">
+      <label><input type="checkbox" name="hide_unknown" value="1" {% if hide_unknown %}checked{% endif %}> Hide unknown</label>
       <label>Sort:</label>
       <select name="sort">
         <option value="date" {% if sort == "date" %}selected{% endif %}>Newest</option>
@@ -27,10 +30,10 @@
     <h3>Latest emails</h3>
     <table border="1" cellpadding="4">
       <tr>
-        <th><a href="?status={{ status }}&sort=company&page_size={{ page_size }}">Company</a></th>
+        <th><a href="?status={{ status }}&exclude={{ exclude }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=company&page_size={{ page_size }}">Company</a></th>
         <th>Job Title</th>
-        <th><a href="?status={{ status }}&sort=status&page_size={{ page_size }}">Status</a></th>
-        <th><a href="?status={{ status }}&sort=date&page_size={{ page_size }}">Email Date</a></th>
+        <th><a href="?status={{ status }}&exclude={{ exclude }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=status&page_size={{ page_size }}">Status</a></th>
+        <th><a href="?status={{ status }}&exclude={{ exclude }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=date&page_size={{ page_size }}">Email Date</a></th>
       </tr>
       {% for row in rows %}
         <tr>
@@ -45,10 +48,10 @@
     <div style="margin-top: 1em;">
       <span>Page {{ page }}{% if total_rows %} of ~{{ (total_rows // page_size) + (1 if total_rows % page_size else 0) }}{% endif %}</span>
       {% if has_prev %}
-        <a href="?status={{ status }}&sort={{ sort }}&page={{ page - 1 }}&page_size={{ page_size }}">Prev</a>
+        <a href="?status={{ status }}&exclude={{ exclude }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort={{ sort }}&page={{ page - 1 }}&page_size={{ page_size }}">Prev</a>
       {% endif %}
       {% if has_next %}
-        <a href="?status={{ status }}&sort={{ sort }}&page={{ page + 1 }}&page_size={{ page_size }}">Next</a>
+        <a href="?status={{ status }}&exclude={{ exclude }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort={{ sort }}&page={{ page + 1 }}&page_size={{ page_size }}">Next</a>
       {% endif %}
     </div>
   </body>

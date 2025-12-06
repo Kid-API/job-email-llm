@@ -67,6 +67,9 @@ def ensure_tables(conn):
 @app.route("/")
 def home():
     status = request.args.get("status", "").strip()
+    raw_exclude = request.args.get("exclude", "")
+    exclude_statuses = [s.strip() for s in raw_exclude.split(",") if s.strip()]
+    hide_unknown = request.args.get("hide_unknown", "") in ("1", "true", "yes", "on")
     sort = request.args.get("sort", "date")
     try:
         page = max(1, int(request.args.get("page", "1")))
@@ -86,10 +89,17 @@ def home():
     base_filter = f"NOT ({company_expr} = 'unknown' AND {title_expr} = 'unknown')"
 
     where_clauses = [base_filter]
-    params = []
+    params: list[str] = []
     if status:
         where_clauses.append(f"{status_expr} = ?")
         params.append(status)
+    if exclude_statuses:
+        placeholders = ",".join("?" for _ in exclude_statuses)
+        where_clauses.append(f"{status_expr} NOT IN ({placeholders})")
+        params.extend(exclude_statuses)
+    if hide_unknown:
+        where_clauses.append(f"{status_expr} <> 'unknown'")
+
     where = "WHERE " + " AND ".join(where_clauses)
 
     sort_map = {
@@ -122,9 +132,10 @@ def home():
         f"""
         SELECT COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*) AS count
         FROM applications a
-        WHERE {base_filter}
+        WHERE {" AND ".join(where_clauses)}
         GROUP BY 1
-        """
+        """,
+        tuple(params),
     )
     has_prev = page > 1
     has_next = offset + page_size < total_rows
@@ -133,6 +144,8 @@ def home():
         rows=rows,
         counts=counts,
         status=status,
+        exclude=raw_exclude,
+        hide_unknown=hide_unknown,
         sort=sort,
         page=page,
         page_size=page_size,
