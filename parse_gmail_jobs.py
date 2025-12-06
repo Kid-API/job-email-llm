@@ -398,10 +398,9 @@ def main():
     skipped_blacklist = 0
     skipped_prefilter = 0
     for idx, mail in enumerate(emails, 1):
-        # Temporarily disable duplicate skip to reprocess all emails
-        # if mail['id'] in existing_ids:
-        #     skipped_dupe += 1
-        #     continue
+        if mail['id'] in existing_ids:
+            skipped_dupe += 1
+            continue
         if contains_blacklist_keywords(mail):
             skipped_blacklist += 1
             continue
