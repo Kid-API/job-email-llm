@@ -79,8 +79,18 @@ def home():
     page_size = max(10, min(page_size, 200))
 
     status_expr = "COALESCE(NULLIF(a.status, ''), 'unknown')"
-    where = f"WHERE {status_expr} = ?" if status else ""
-    params = (status,) if status else ()
+    company_expr = "COALESCE(NULLIF(TRIM(a.company), ''), 'unknown')"
+    title_expr = "COALESCE(NULLIF(TRIM(a.job_title), ''), 'unknown')"
+
+    # Always ignore rows where both company and title are blank/unknown.
+    base_filter = f"NOT ({company_expr} = 'unknown' AND {title_expr} = 'unknown')"
+
+    where_clauses = [base_filter]
+    params = []
+    if status:
+        where_clauses.append(f"{status_expr} = ?")
+        params.append(status)
+    where = "WHERE " + " AND ".join(where_clauses)
 
     sort_map = {
         "date": "e.date_email_iso DESC",
@@ -109,8 +119,12 @@ def home():
         params + (page_size, offset),
     )
     counts = query(
-        "SELECT COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*) AS count "
-        "FROM applications GROUP BY 1"
+        f"""
+        SELECT COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*) AS count
+        FROM applications a
+        WHERE {base_filter}
+        GROUP BY 1
+        """
     )
     has_prev = page > 1
     has_next = offset + page_size < total_rows
