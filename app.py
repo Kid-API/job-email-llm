@@ -174,8 +174,9 @@ def home():
     ]
     counts = query(
         f"""
-        SELECT COALESCE(NULLIF(status, ''), 'unknown') AS status, COUNT(*) AS count
+        SELECT COALESCE(NULLIF(a.status, ''), 'unknown') AS status, COUNT(*) AS count
         FROM applications a
+        JOIN emails e ON a.email_id = e.id
         WHERE {" AND ".join(where_clauses)}
         GROUP BY 1
         """,
