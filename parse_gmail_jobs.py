@@ -4,9 +4,10 @@ import base64
 import csv
 import sqlite3
 import threading
-import subprocess
 import json
 import time
+import boto3
+from botocore.config import Config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -130,7 +131,23 @@ def get_job_emails(service, query=None, max_total=400):
             break
     return emails
 
-def extract_job_status_ollama(subject, body):
+_bedrock_client = None
+
+
+def get_bedrock_client():
+    """Create a Bedrock runtime client once, re-use it."""
+    global _bedrock_client
+    if _bedrock_client is None:
+        region = os.getenv("AWS_REGION", "us-east-1")
+        _bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+        )
+    return _bedrock_client
+
+
+def extract_job_status_claude(subject, body):
     prompt = f"""
 You are a filter and parser for job application emails.
 First, determine if this email is actually related to a *work/job application, interview, or job search communication*. 
@@ -151,21 +168,48 @@ Only output the JSON object.
 """
     try:
         llm_start = time.time()
-        result = subprocess.run(
-            ['ollama', 'run', 'llama3', prompt],
-            capture_output=True, text=True
+        client = get_bedrock_client()
+        model_id = os.getenv(
+            "BEDROCK_MODEL_ID",
+            "anthropic.claude-3-haiku-20240307-v1:0",
         )
-        response = result.stdout
-        start = response.find('{')
-        end = response.rfind('}') + 1
-        json_text = response[start:end]
+        payload = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 400,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt}
+                    ],
+                }
+            ],
+        }
+
+        response = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(payload).encode("utf-8"),
+            contentType="application/json",
+            accept="application/json",
+        )
+        raw_body = response["body"].read()
+        model_json = json.loads(raw_body)
+        content = model_json.get("content", [])
+        text = ""
+        if content and isinstance(content, list):
+            first = content[0]
+            text = first.get("text", "") if isinstance(first, dict) else ""
+
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        json_text = text[start:end] if start != -1 and end != 0 else text
         try:
             data = json.loads(json_text)
         except Exception as e:
-            print("Warning: Couldn't parse JSON! This is what Ollama sent back:")
-            print(response)
+            print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
             data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
-        print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
+        print(f"Bedrock time: {time.time() - llm_start:.2f} seconds")
         return data
     except Exception as e:
         print("Warning: Could not parse JSON from LLM output:", str(e))
@@ -181,7 +225,7 @@ def process_email(mail, idx, blacklist_keywords):
     if contains_blacklist_keywords(mail, blacklist_keywords):
         print(f"Skipping email with blacklisted keyword: {mail['subject']}")
         return None
-    llm_result = extract_job_status_ollama(mail['subject'], mail['body'])
+    llm_result = extract_job_status_claude(mail['subject'], mail['body'])
     if not llm_result.get("relevant", True):
         print(f"Skipping non-job email (reason: {llm_result.get('reason', '')})")
         return None
@@ -246,5 +290,5 @@ def main():
 if __name__ == "__main__":
     while True:
         main()
-        print("Waiting 5 minutes before next batch...")
-        time.sleep(300)
+        print("Waiting 2 minutes before next batch...")
+        time.sleep(120)
