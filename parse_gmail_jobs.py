@@ -7,8 +7,10 @@ import json
 import time
 import boto3
 import sys
+import random
 from email.utils import parsedate_to_datetime
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -215,7 +217,7 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=4000):
+def get_job_emails(service, query=None, max_total=500):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
@@ -316,62 +318,69 @@ Email body snippet (trimmed): {body_snippet}
 Only output the JSON object.
 """
 
-    try:
-        llm_start = time.time()
-        client = get_bedrock_client()
-        model_id = os.getenv(
-            "BEDROCK_MODEL_ID",
-            "anthropic.claude-3-haiku-20240307-v1:0",
-        )
-        payload = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 400,
-            "temperature": 0,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt}
-                    ],
-                }
-            ],
-        }
+    llm_start = time.time()
+    client = get_bedrock_client()
+    model_id = os.getenv(
+        "BEDROCK_MODEL_ID",
+        "anthropic.claude-3-haiku-20240307-v1:0",
+    )
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 400,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ],
+            }
+        ],
+    }
 
-        response = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(payload).encode("utf-8"),
-            contentType="application/json",
-            accept="application/json",
-        )
-        raw_body = response["body"].read()
-        model_json = json.loads(raw_body)
-        content = model_json.get("content", [])
-        text = ""
-        if content and isinstance(content, list):
-            first = content[0]
-            text = first.get("text", "") if isinstance(first, dict) else ""
-
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        json_text = text[start:end] if start != -1 and end != 0 else text
+    for attempt in range(3):  # simple retry for throttling
         try:
-            data = json.loads(json_text)
-        except Exception as e:
-            print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
-            data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
-        print(f"Bedrock time: {time.time() - llm_start:.2f} seconds")
-        return data
-    except Exception as e:
-        print("Warning: Could not parse JSON from LLM output:", str(e))
-        return {
-            "relevant": False,
-            "reason": "Parsing failed",
-            "jobs": [],
-            "error": "Parsing failed",
-        }
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(payload).encode("utf-8"),
+                contentType="application/json",
+                accept="application/json",
+            )
+            raw_body = response["body"].read()
+            model_json = json.loads(raw_body)
+            content = model_json.get("content", [])
+            text = ""
+            if content and isinstance(content, list):
+                first = content[0]
+                text = first.get("text", "") if isinstance(first, dict) else ""
 
-# Blacklist for obvious non-job junk
-blacklist_keywords = load_blacklist()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            json_text = text[start:end] if start != -1 and end != 0 else text
+            try:
+                data = json.loads(json_text)
+            except Exception as e:
+                print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
+                data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
+            print(f"Bedrock time: {time.time() - llm_start:.2f} seconds")
+            return data
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            if code == "ThrottlingException" and attempt < 2:
+                time.sleep(1.0 * (attempt + 1) + random.random() * 0.5)
+                continue
+            print("Warning: Could not parse JSON from LLM output:", str(e))
+            break
+        except Exception as e:
+            print("Warning: Could not parse JSON from LLM output:", str(e))
+            break
+
+    return {
+        "relevant": False,
+        "reason": "Parsing failed",
+        "jobs": [],
+        "error": "Parsing failed",
+    }
 
 def contains_blacklist_keywords(mail, blacklist_keywords):
     # Only filter on subject and sender
@@ -410,7 +419,17 @@ def process_email(mail, idx):
         )
         return (idx, mail, llm_result)
     except Exception as e:
-        ...
+        print(f"LLM error for email {idx}: {e}")
+        return (
+            idx,
+            mail,
+            {
+                "jobs": [],
+                "relevant": False,
+                "reason": str(e),
+                "error": str(e),
+            },
+        )
 
 
 
@@ -442,7 +461,7 @@ def main():
     output_rows = []
     start_all = time.time()
     skipped_not_relevant = 0
-    with ThreadPoolExecutor(max_workers=6) as executor:  # adjust concurrency
+    with ThreadPoolExecutor(max_workers=3) as executor:  # adjust concurrency
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
