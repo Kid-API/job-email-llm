@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <h1>Job Applications</h1>
+
+    <form method="get">
+      <label>Status filter (e.g., applied, interview, offer, rejection):</label>
+      <input name="status" value="{{ status }}">
+      <label>Exclude statuses (comma-separated):</label>
+      <input name="exclude" value="{{ exclude }}">
+      <label>Start date (YYYY-MM-DD):</label>
+      <input name="start_date" value="{{ start_date }}">
+      <label>End date (YYYY-MM-DD):</label>
+      <input name="end_date" value="{{ end_date }}">
+      <label><input type="checkbox" name="hide_unknown" value="1" {% if hide_unknown %}checked{% endif %}> Hide unknown</label>
+      <label>Sort:</label>
+      <select name="sort">
+        <option value="date" {% if sort == "date" %}selected{% endif %}>Newest</option>
+        <option value="company" {% if sort == "company" %}selected{% endif %}>Company</option>
+        <option value="status" {% if sort == "status" %}selected{% endif %}>Status</option>
+      </select>
+      <label>Page size:</label>
+      <input name="page_size" value="{{ page_size }}" size="4">
+      <button type="submit">Filter</button>
+    </form>
+
+    <h3>Counts by status</h3>
+    <ul>
+      {% for row in counts %}
+        <li>{{ row["status"] or "unknown" }}: {{ row["count"] }}</li>
+      {% endfor %}
+    </ul>
+
+    <h3>Latest emails</h3>
+    <table border="1" cellpadding="4">
+      <tr>
+        <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=company&page_size={{ page_size }}">Company</a></th>
+        <th>Job Title</th>
+        <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=status&page_size={{ page_size }}">Status</a></th>
+        <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=date&page_size={{ page_size }}">Email Date</a></th>
+      </tr>
+      {% for row in rows %}
+        <tr>
+          <td>{{ row["company"] }}</td>
+          <td>{{ row["job_title"] }}</td>
+          <td>{{ row["status"] }}</td>
+          <td>{{ row["date_display"] }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+
+    <div style="margin-top: 1em;">
+      <span>Page {{ page }}{% if total_rows %} of ~{{ (total_rows // page_size) + (1 if total_rows % page_size else 0) }}{% endif %}</span>
+      {% if has_prev %}
+        <a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort={{ sort }}&page={{ page - 1 }}&page_size={{ page_size }}">Prev</a>
+      {% endif %}
+      {% if has_next %}
+        <a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort={{ sort }}&page={{ page + 1 }}&page_size={{ page_size }}">Next</a>
+      {% endif %}
+    </div>
+  </body>
+</html>

@@ -7,6 +7,7 @@ import base64
 import csv
 import subprocess
 import json
+from status_utils import clean_status
 
 # OAuth and Gmail API setup
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -77,7 +78,7 @@ def extract_job_status_ollama(email_text):
         data = json.loads(result.stdout[json_start:json_end])
         return data
     except Exception as e:
-        print("Warning: Could not parse JSON from LLM output:", result.stdout)
+        print("Warning: Could not parse JSON from LLM output (payload suppressed):", str(e))
         return {"company": "", "job_title": "", "status": "", "date": "", "error": "Parsing failed"}
 
 def main():
@@ -95,7 +96,7 @@ def main():
             "date_email": mail['date'],
             "company": llm_result.get("company", ""),
             "job_title": llm_result.get("job_title", ""),
-            "status": llm_result.get("status", ""),
+            "status": clean_status(llm_result.get("status", "")),
             "parsed_date": llm_result.get("date", ""),
             "error": llm_result.get("error", "")
         }

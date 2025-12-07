@@ -2,3 +2,10 @@ token.pickle
 credentials.json
 parsed_job_apps.csv
 __pycache__/
+jobs.db
+venv/
+Test_Job_Apps_Dedupe.pdf
+
+jobs.db
+jobs.db-wal
+jobs.db-shm
