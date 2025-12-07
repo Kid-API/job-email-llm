@@ -3,16 +3,18 @@ import pickle
 import base64
 import sqlite3
 import threading
-import subprocess
 import json
 import time
+import boto3
 import sys
 from email.utils import parsedate_to_datetime
+from botocore.config import Config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from status_utils import clean_status
+
 
 # Paths and database setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,21 +22,7 @@ sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "jobs.db")
 _db_lock = threading.Lock()
 
-from status_utils import clean_status
 
-
-def detect_platform(sender):
-    """Roughly tag known platforms from the sender address."""
-    s = (sender or "").lower()
-    if "linkedin.com" in s:
-        return "linkedin"
-    if "indeed.com" in s:
-        return "indeed"
-    if "greenhouse.io" in s:
-        return "greenhouse"
-    if "lever.co" in s:
-        return "lever"
-    return "other"
 
 
 def detect_platform(sender):
@@ -283,7 +271,23 @@ def get_job_emails(service, query=None, max_total=4000):
             break
     return emails
 
-def extract_job_status_ollama(subject, body_snippet, platform):
+_bedrock_client = None
+
+
+def get_bedrock_client():
+    """Create a Bedrock runtime client once, re-use it."""
+    global _bedrock_client
+    if _bedrock_client is None:
+        region = os.getenv("AWS_REGION", "us-east-1")
+        _bedrock_client = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+        )
+    return _bedrock_client
+
+
+def extract_job_status_claude(subject, body_snippet, platform="other"):
     prompt = f"""
 You are a filter and parser for job application emails.
 First, decide if this email is about a job (application, interview, offer, rejection, recruiter outreach, etc.).
@@ -311,30 +315,51 @@ Email body snippet (trimmed): {body_snippet}
 
 Only output the JSON object.
 """
+
     try:
         llm_start = time.time()
-        result = subprocess.run(
-            ['ollama', 'run', 'llama3', prompt],
-            capture_output=True, text=True
+        client = get_bedrock_client()
+        model_id = os.getenv(
+            "BEDROCK_MODEL_ID",
+            "anthropic.claude-3-haiku-20240307-v1:0",
         )
-        if result.returncode != 0:
-            print(f"Ollama error {result.returncode}: {result.stderr[:500]}")
-        response = result.stdout
-        start = response.find('{')
-        end = response.rfind('}') + 1
-        json_text = response[start:end]
+        payload = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 400,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt}
+                    ],
+                }
+            ],
+        }
+
+        response = client.invoke_model(
+            modelId=model_id,
+            body=json.dumps(payload).encode("utf-8"),
+            contentType="application/json",
+            accept="application/json",
+        )
+        raw_body = response["body"].read()
+        model_json = json.loads(raw_body)
+        content = model_json.get("content", [])
+        text = ""
+        if content and isinstance(content, list):
+            first = content[0]
+            text = first.get("text", "") if isinstance(first, dict) else ""
+
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        json_text = text[start:end] if start != -1 and end != 0 else text
         try:
             data = json.loads(json_text)
         except Exception as e:
             print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
-            data = {
-                "relevant": False,
-                "reason": "Parsing failed",
-                "jobs": [],
-                "error": str(e),
-            }
-
-        print(f"Ollama time: {time.time() - llm_start:.2f} seconds")
+            data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
+        print(f"Bedrock time: {time.time() - llm_start:.2f} seconds")
         return data
     except Exception as e:
         print("Warning: Could not parse JSON from LLM output:", str(e))
@@ -353,7 +378,6 @@ def contains_blacklist_keywords(mail, blacklist_keywords):
     text = (mail['subject'] + ' ' + mail['from']).lower()
     return any(word in text for word in blacklist_keywords)
 
-
 # Cheap local filter to avoid sending obvious non-job emails to the LLM
 job_like_keywords = [
     "job", "application", "applied", "interview", "offer",
@@ -361,11 +385,9 @@ job_like_keywords = [
     "recruit", "recruiter", "opening"
 ]
 
-
 def looks_job_related(mail):
     text = (mail.get("subject", "") + " " + mail.get("body", "")).lower()
     return any(word in text for word in job_like_keywords)
-
 
 def to_iso_date(date_str):
     """Convert email date header to ISO string for sorting."""
@@ -373,29 +395,24 @@ def to_iso_date(date_str):
         dt = parsedate_to_datetime(date_str)
         if dt is None:
             return ""
-        # Normalize to naive UTC ISO for consistent sorting
         if dt.tzinfo:
             dt = dt.astimezone(tz=None)
         return dt.isoformat()
     except Exception:
         return ""
 
-
 def process_email(mail, idx):
     try:
-        llm_result = extract_job_status_ollama(
+        llm_result = extract_job_status_claude(
             mail.get('subject_trimmed', mail.get('subject', '')),
             mail.get('body_snippet', mail.get('body', '')),
             mail.get('platform', 'other'),
         )
         return (idx, mail, llm_result)
     except Exception as e:
-        print(f"LLM error for email {idx}: {e}")
-        return (idx, mail, {
-            "jobs": [],
-            "relevant": False,
-            "reason": str(e), "error": str(e)
-        })
+        ...
+
+
 
 def main():
     blacklist_keywords = load_blacklist()
@@ -498,5 +515,5 @@ def main():
 if __name__ == "__main__":
     while True:
         main()
-        print("Waiting 5 minutes before next batch...")
-        time.sleep(200)  # Sleep for 200 seconds (5 minutes)
+        print("Waiting 2 minutes before next batch...")
+        time.sleep(120)
