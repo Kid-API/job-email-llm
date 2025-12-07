@@ -1,4 +1,18 @@
-status_map = {
+"""
+Helpers for cleaning and standardizing application status values.
+"""
+
+# Known statuses we want to standardize to.
+CANONICAL = {
+    "applied",
+    "interview",
+    "offer",
+    "rejected",
+    "unknown",
+}
+
+# Map a bunch of variations to the canonical buckets.
+STATUS_MAP = {
     "application received": "applied",
     "applied": "applied",
     "applied for": "applied",
@@ -15,14 +29,15 @@ status_map = {
     "offer": "offer",
     "other": "unknown",
     "": "unknown",
-    None: "unknown",
 }
 
 
 def clean_status(raw_status):
     """
-    Normalize varied status strings to a small set of known values.
-    Defaults to 'unknown' if the input is missing or not recognized.
+    Normalize a raw status string to one of the canonical values.
+
+    - Lowercases and trims whitespace.
+    - Falls back to "unknown" when we don't recognize it.
     """
-    normalized = (raw_status or "").strip().lower()
-    return status_map.get(normalized, "unknown")
+    s = (raw_status or "").strip().lower()
+    return STATUS_MAP.get(s, "unknown")

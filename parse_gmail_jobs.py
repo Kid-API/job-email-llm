@@ -6,6 +6,7 @@ import threading
 import subprocess
 import json
 import time
+import sys
 from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
@@ -15,8 +16,25 @@ from status_utils import clean_status
 
 # Paths and database setup
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "jobs.db")
 _db_lock = threading.Lock()
+
+from status_utils import clean_status
+
+
+def detect_platform(sender):
+    """Roughly tag known platforms from the sender address."""
+    s = (sender or "").lower()
+    if "linkedin.com" in s:
+        return "linkedin"
+    if "indeed.com" in s:
+        return "indeed"
+    if "greenhouse.io" in s:
+        return "greenhouse"
+    if "lever.co" in s:
+        return "lever"
+    return "other"
 
 
 def detect_platform(sender):
@@ -180,6 +198,7 @@ def save_rows(conn, rows):
             applications,
         )
 
+
 # Gmail API setup
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
@@ -207,7 +226,8 @@ def load_blacklist(filename="blacklist.txt"):
         words = [line.strip().lower() for line in f if line.strip()]
     return words
 
-def get_job_emails(service, query=None, max_total=400):
+
+def get_job_emails(service, query=None, max_total=4000):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
@@ -325,6 +345,9 @@ Only output the JSON object.
             "error": "Parsing failed",
         }
 
+# Blacklist for obvious non-job junk
+blacklist_keywords = load_blacklist()
+
 def contains_blacklist_keywords(mail, blacklist_keywords):
     # Only filter on subject and sender
     text = (mail['subject'] + ' ' + mail['from']).lower()
@@ -379,7 +402,7 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=50)  # Lowered for testing; increase as needed
+    emails = get_job_emails(service, max_total=4000)
 
     existing_ids = load_existing_ids(conn)
 
@@ -390,8 +413,8 @@ def main():
     for idx, mail in enumerate(emails, 1):
         # Temporarily disable duplicate skip to reprocess all emails
         if mail['id'] in existing_ids:
-             skipped_dupe += 1
-             continue
+            skipped_dupe += 1
+            continue
         if contains_blacklist_keywords(mail):
             skipped_blacklist += 1
             continue
