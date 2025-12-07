@@ -415,7 +415,7 @@ def main():
         if mail['id'] in existing_ids:
             skipped_dupe += 1
             continue
-        if contains_blacklist_keywords(mail):
+        if contains_blacklist_keywords(mail, blacklist_keywords):
             skipped_blacklist += 1
             continue
         if not looks_job_related(mail):
