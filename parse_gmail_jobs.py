@@ -1,7 +1,6 @@
 import os
 import pickle
 import base64
-import csv
 import sqlite3
 import threading
 import subprocess
@@ -181,7 +180,6 @@ def save_rows(conn, rows):
             applications,
         )
 
-
 # Gmail API setup
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
@@ -205,13 +203,11 @@ def load_blacklist(filename="blacklist.txt"):
     if not os.path.exists(filename):
         print(f"Warning: {filename} not found. No blacklist will be applied.")
         return []
-
     with open(filename, "r") as f:
         words = [line.strip().lower() for line in f if line.strip()]
     return words
 
-
-def get_job_emails(service, query=None, max_total=50):
+def get_job_emails(service, query=None, max_total=400):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
@@ -238,12 +234,12 @@ def get_job_emails(service, query=None, max_total=50):
             try:
                 if 'parts' in msg_detail['payload']:
                     for part in msg_detail['payload']['parts']:
-                        if part['mimeType'] == 'text/plain' and 'data' in part['body']:
+                        if part.get('mimeType') == 'text/plain' and 'data' in part['body']:
                             body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
                             break
                 else:
                     body = base64.urlsafe_b64decode(msg_detail['payload']['body']['data']).decode('utf-8')
-            except Exception as e:
+            except Exception:
                 body = "(Unable to decode email body)"
             platform = detect_platform(sender)
             subject_trimmed = (subject or "")[:250]
@@ -304,11 +300,9 @@ Only output the JSON object.
         if result.returncode != 0:
             print(f"Ollama error {result.returncode}: {result.stderr[:500]}")
         response = result.stdout
-
         start = response.find('{')
         end = response.rfind('}') + 1
         json_text = response[start:end]
-
         try:
             data = json.loads(json_text)
         except Exception as e:
@@ -331,10 +325,8 @@ Only output the JSON object.
             "error": "Parsing failed",
         }
 
-# Blacklist for obvious non-job junk
-blacklist_keywords = load_blacklist()
-
-def contains_blacklist_keywords(mail):
+def contains_blacklist_keywords(mail, blacklist_keywords):
+    # Only filter on subject and sender
     text = (mail['subject'] + ' ' + mail['from']).lower()
     return any(word in text for word in blacklist_keywords)
 
@@ -383,6 +375,7 @@ def process_email(mail, idx):
         })
 
 def main():
+    blacklist_keywords = load_blacklist()
     service = authenticate_gmail()
     conn = get_conn()
 
@@ -396,9 +389,9 @@ def main():
     skipped_prefilter = 0
     for idx, mail in enumerate(emails, 1):
         # Temporarily disable duplicate skip to reprocess all emails
-        # if mail['id'] in existing_ids:
-        #     skipped_dupe += 1
-        #     continue
+        if mail['id'] in existing_ids:
+             skipped_dupe += 1
+             continue
         if contains_blacklist_keywords(mail):
             skipped_blacklist += 1
             continue
@@ -406,7 +399,6 @@ def main():
             skipped_prefilter += 1
             continue
         emails_to_process.append((mail, idx))
-
     output_rows = []
     start_all = time.time()
     skipped_not_relevant = 0
@@ -461,6 +453,10 @@ def main():
             if idx % 10 == 0:
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
+  #  print("CWD:", os.getcwd())
+  #  print("Rows to write:", len(output_rows))
+  #  if len(output_rows) < 5:
+  #      print("Sample output_rows:", output_rows[:5])
 
     if output_rows:
         save_rows(conn, output_rows)
