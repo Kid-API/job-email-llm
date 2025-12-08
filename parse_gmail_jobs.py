@@ -8,6 +8,7 @@ import time
 import boto3
 import sys
 import random
+import logging
 from email.utils import parsedate_to_datetime
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -24,7 +25,20 @@ sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "jobs.db")
 _db_lock = threading.Lock()
 
+# Structured logging setup
+logging.basicConfig(
+    filename="run.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
+
+def log_event(event, **kwargs):
+    """Write a JSON-style event to the log file."""
+    try:
+        logging.info(json.dumps({"event": event, **kwargs}))
+    except Exception:
+        logging.info({"event": event, **kwargs})
 
 
 def detect_platform(sender):
@@ -217,11 +231,11 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=500):
+def get_job_emails(service, query=None, max_total=200, start_page_token=None):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
-    next_page_token = None
+    next_page_token = start_page_token  # optional resume token from prior run
     fetched = 0
     while fetched < max_total:
         kwargs = {
@@ -271,7 +285,7 @@ def get_job_emails(service, query=None, max_total=500):
         next_page_token = results.get("nextPageToken")
         if not next_page_token:
             break
-    return emails
+    return emails, next_page_token
 
 _bedrock_client = None
 
@@ -338,8 +352,10 @@ Only output the JSON object.
         ],
     }
 
-    for attempt in range(3):  # simple retry for throttling
+    for attempt in range(4):  # simple retry for throttling
         try:
+            # Small pause to reduce throttling
+            time.sleep(1.0 + random.random() * 1.0)
             response = client.invoke_model(
                 modelId=model_id,
                 body=json.dumps(payload).encode("utf-8"),
@@ -362,17 +378,24 @@ Only output the JSON object.
             except Exception as e:
                 print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
                 data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
-            print(f"Bedrock time: {time.time() - llm_start:.2f} seconds")
+            elapsed = time.time() - llm_start
+            print(f"[Bedrock] success model={model_id} time={elapsed:.2f}s")
+            log_event("bedrock_success", model=model_id, elapsed_s=elapsed)
             return data
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
-            if code == "ThrottlingException" and attempt < 2:
-                time.sleep(1.0 * (attempt + 1) + random.random() * 0.5)
+            msg = e.response.get("Error", {}).get("Message", "")
+            req_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
+            print(f"[Bedrock] attempt {attempt+1} failed: code={code} msg={msg} req_id={req_id}")
+            log_event("bedrock_error", attempt=attempt + 1, code=code, msg=msg, req_id=req_id)
+            if code == "ThrottlingException" and attempt < 3:
+                # exponential-ish backoff with jitter
+                time.sleep(2.0 * (attempt + 1) + random.random())
                 continue
-            print("Warning: Could not parse JSON from LLM output:", str(e))
             break
         except Exception as e:
-            print("Warning: Could not parse JSON from LLM output:", str(e))
+            print(f"[Bedrock] attempt {attempt+1} failed: {e}")
+            log_event("bedrock_error", attempt=attempt + 1, error=str(e))
             break
 
     return {
@@ -438,7 +461,28 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=4000)
+    # Read the most recent processed ID (if any) so we can stop when we reach it
+    last_id = None
+    if os.path.exists("last_processed_id.txt"):
+        with open("last_processed_id.txt", "r") as f:
+            last_id = f.read().strip() or None
+        if last_id:
+            print(f"Last processed email ID: {last_id}")
+        else:
+            print("last_processed_id.txt is empty; will process all fetched emails.")
+    else:
+        print("No last_processed_id.txt found; will process all fetched emails.")
+
+    # Keep fetch size aligned with the intended batch size; resume from stored page token if present
+    start_page_token = None
+    token_path = "next_page_token.txt"
+    if os.path.exists(token_path):
+        with open(token_path, "r") as f:
+            start_page_token = f.read().strip() or None
+        if start_page_token:
+            print(f"Resuming from stored page token.")
+
+    emails, new_page_token = get_job_emails(service, max_total=100, start_page_token=start_page_token)
 
     existing_ids = load_existing_ids(conn)
 
@@ -447,10 +491,14 @@ def main():
     skipped_blacklist = 0
     skipped_prefilter = 0
     for idx, mail in enumerate(emails, 1):
+        # Stop if we reach the last processed ID from the previous run
+        if last_id and mail['id'] == last_id:
+            print("Reached last processed email. Stopping this batch.")
+            break
         # Temporarily disable duplicate skip to reprocess all emails
-        if mail['id'] in existing_ids:
-            skipped_dupe += 1
-            continue
+       # if mail['id'] in existing_ids:
+       #     skipped_dupe += 1
+       #    continue
         if contains_blacklist_keywords(mail, blacklist_keywords):
             skipped_blacklist += 1
             continue
@@ -461,12 +509,15 @@ def main():
     output_rows = []
     start_all = time.time()
     skipped_not_relevant = 0
-    with ThreadPoolExecutor(max_workers=3) as executor:  # adjust concurrency
+    error_counts = {}
+    with ThreadPoolExecutor(max_workers=1) as executor:  # adjust concurrency
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
             if not llm_result.get("relevant", True):
                 skipped_not_relevant += 1
+                key = llm_result.get("error") or llm_result.get("reason") or "not_relevant"
+                error_counts[key] = error_counts.get(key, 0) + 1
                 continue
             jobs = llm_result.get("jobs", [])
             if not isinstance(jobs, list):
@@ -491,6 +542,8 @@ def main():
                         "error": llm_result.get("error", ""),
                     }
                 )
+            key = llm_result.get("error") or "ok"
+            error_counts[key] = error_counts.get(key, 0) + 1
             row = {
                 "id": mail['id'],
                 "email_num": idx,
@@ -509,6 +562,8 @@ def main():
             }
             output_rows.append(row)
             existing_ids.add(mail['id'])
+            # Pause slightly between emails to reduce throttling
+            time.sleep(1.0 + random.random() * 0.5)
             if idx % 10 == 0:
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
@@ -520,8 +575,25 @@ def main():
     if output_rows:
         save_rows(conn, output_rows)
         print(f"Saved {len(output_rows)} rows into {DB_PATH}")
+        # Persist the oldest email ID in this batch so next run skips down to it
+        oldest_id = emails_to_process[-1][0]['id'] if emails_to_process else None
+        if oldest_id:
+            with open("last_processed_id.txt", "w") as f:
+                f.write(oldest_id)
+            print(f"Saved oldest processed email ID: {oldest_id}")
     else:
         print("No new rows to save to the database.")
+
+    # Persist the next page token (if any) so next run can resume deeper
+    with open(token_path, "w") as f:
+        f.write(new_page_token or "")
+    if new_page_token:
+        print("Saved next page token for next run.")
+    else:
+        print("No next page token; reached end of available pages for this query.")
+
+    print("Error summary:", error_counts)
+    log_event("run_summary", errors=error_counts)
 
     print(
         f"Run summary: fetched {len(emails)}; "
