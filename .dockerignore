@@ -1,0 +1,18 @@
+.git
+.gitignore
+.DS_Store
+
+venv/
+__pycache__/
+*.py[cod]
+
+# Local data/secrets
+jobs.db
+jobs.db*
+parsed_job_apps.csv
+run.log
+token.pickle
+credentials.json
+
+# Editor/project files
+.vscode/
