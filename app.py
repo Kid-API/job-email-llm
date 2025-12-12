@@ -203,4 +203,5 @@ def home():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Bind to all interfaces for Docker/EC2 and disable the dev debugger
+    app.run(host="0.0.0.0", debug=False)

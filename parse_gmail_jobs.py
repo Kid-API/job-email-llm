@@ -305,7 +305,7 @@ def get_bedrock_client():
     return _bedrock_client
 
 
-def extract_job_status_claude(subject, body_snippet, platform="other"):
+def extract_job_status_claude(subject, body_snippet, platform="other", sender=""):
     prompt = f"""
 You are a filter and parser for job application emails.
 First, decide if this email is about a job (application, interview, offer, rejection, recruiter outreach, etc.).
@@ -336,7 +336,7 @@ Only output the JSON object.
 
     llm_start = time.time()
     client = get_bedrock_client()
-    model_id = choose_model(subject, body_snippet)
+    model_id = choose_model(subject, body_snippet, sender=sender, platform=platform)
     print(f"[Bedrock] using model={model_id}")
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
@@ -420,8 +420,16 @@ job_like_keywords = [
 HAIKU_ID = "anthropic.claude-3-haiku-20240307-v1:0"
 SONNET_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 
-def choose_model(subject: str, body_snippet: str) -> str:
-    """Send easy/short/obvious emails to Haiku, tougher ones to Sonnet."""
+def choose_model(subject: str, body_snippet: str, sender: str = "", platform: str = "") -> str:
+    """
+    Send easy/short/obvious emails to Haiku, tougher ones to Sonnet.
+    Always route LinkedIn/Greenhouse to Sonnet.
+    """
+    s = (sender or "").lower()
+    if "linkedin.com" in s or "greenhouse.io" in s:
+        return SONNET_ID
+    if platform and platform.lower() in ("linkedin", "greenhouse"):
+        return SONNET_ID
     subj = (subject or "").lower()
     body = (body_snippet or "").lower()
     text = subj + " " + body
@@ -527,6 +535,7 @@ def process_email(mail, idx):
             mail.get('subject_trimmed', mail.get('subject', '')),
             mail.get('body_snippet', mail.get('body', '')),
             mail.get('platform', 'other'),
+            mail.get('from', ''),
         )
         return (idx, mail, llm_result)
     except Exception as e:
@@ -631,9 +640,13 @@ def main():
             for job in jobs:
                 cleaned_company = clean_company(job.get("company", ""), mail.get("from", ""))
                 cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
+                if not cleaned_company or cleaned_company.lower() == "unknown":
+                    continue
                 if not cleaned_title:
                     inferred = infer_title_from_subject(mail.get("subject", ""), cleaned_company)
                     cleaned_title = clean_job_title(inferred, mail.get("from", ""))
+                if not cleaned_title:
+                    continue
                 applications.append(
                     {
                         "company": cleaned_company,
@@ -646,6 +659,8 @@ def main():
                 )
             key = llm_result.get("error") or "ok"
             error_counts[key] = error_counts.get(key, 0) + 1
+            if not applications:
+                continue
             row = {
                 "id": mail['id'],
                 "email_num": idx,
