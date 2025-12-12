@@ -272,6 +272,7 @@ def get_job_emails(service, query=None, max_total=200, start_page_token=None):
             body_snippet = (body or "")[:1200]
             emails.append({
                 'id': msg['id'],
+                'thread_id': msg_detail.get('threadId', ''),
                 'subject': subject,
                 'subject_trimmed': subject_trimmed,
                 'from': sender,
@@ -575,8 +576,10 @@ def main():
 
     emails_to_process = []
     skipped_dupe = 0
+    skipped_thread = 0
     skipped_blacklist = 0
     skipped_prefilter = 0
+    threads_seen: set[str] = set()
     for idx, mail in enumerate(emails, 1):
         # Stop if we reach the last processed ID from the previous run
         if last_id and mail['id'] == last_id:
@@ -586,6 +589,13 @@ def main():
         if mail['id'] in existing_ids:
             skipped_dupe += 1
             continue
+        # Collapse multiple messages in the same thread; keep the first (newest) one
+        thread_id = mail.get("thread_id", "")
+        if thread_id:
+            if thread_id in threads_seen:
+                skipped_thread += 1
+                continue
+            threads_seen.add(thread_id)
         if contains_blacklist_keywords(mail, blacklist_keywords):
             skipped_blacklist += 1
             continue
@@ -690,6 +700,7 @@ def main():
     print(
         f"Run summary: fetched {len(emails)}; "
         f"dupes skipped {skipped_dupe}; "
+        f"threads skipped {skipped_thread}; "
         f"blacklist skipped {skipped_blacklist}; "
         f"prefilter skipped {skipped_prefilter}; "
         f"LLM skipped {skipped_not_relevant}; "
