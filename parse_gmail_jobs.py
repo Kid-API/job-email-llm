@@ -354,8 +354,8 @@ Only output the JSON object.
 
     for attempt in range(4):  # simple retry for throttling
         try:
-            # Small pause to reduce throttling
-            time.sleep(1.0 + random.random() * 1.0)
+            # Slightly longer pause to reduce throttling
+            time.sleep(2.0 + random.random() * 1.0)
             response = client.invoke_model(
                 modelId=model_id,
                 body=json.dumps(payload).encode("utf-8"),
@@ -482,7 +482,7 @@ def main():
         if start_page_token:
             print(f"Resuming from stored page token.")
 
-    emails, new_page_token = get_job_emails(service, max_total=100, start_page_token=start_page_token)
+    emails, new_page_token = get_job_emails(service, max_total=75, start_page_token=start_page_token)
 
     existing_ids = load_existing_ids(conn)
 
@@ -563,7 +563,7 @@ def main():
             output_rows.append(row)
             existing_ids.add(mail['id'])
             # Pause slightly between emails to reduce throttling
-            time.sleep(1.0 + random.random() * 0.5)
+            time.sleep(1.5 + random.random() * 0.5)
             if idx % 10 == 0:
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
@@ -606,5 +606,5 @@ def main():
 if __name__ == "__main__":
     while True:
         main()
-        print("Waiting 2 minutes before next batch...")
-        time.sleep(120)
+        print("Waiting 5 minutes before next batch...")
+        time.sleep(300)
