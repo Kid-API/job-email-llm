@@ -7,8 +7,12 @@ import json
 import time
 import boto3
 import sys
+import random
+import logging
+import re
 from email.utils import parsedate_to_datetime
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -22,7 +26,20 @@ sys.path.insert(0, BASE_DIR)
 DB_PATH = os.path.join(BASE_DIR, "jobs.db")
 _db_lock = threading.Lock()
 
+# Structured logging setup
+logging.basicConfig(
+    filename="run.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
+
+def log_event(event, **kwargs):
+    """Write a JSON-style event to the log file."""
+    try:
+        logging.info(json.dumps({"event": event, **kwargs}))
+    except Exception:
+        logging.info({"event": event, **kwargs})
 
 
 def detect_platform(sender):
@@ -215,11 +232,11 @@ def load_blacklist(filename="blacklist.txt"):
     return words
 
 
-def get_job_emails(service, query=None, max_total=4000):
+def get_job_emails(service, query=None, max_total=200, start_page_token=None):
     if not query:
         query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
     emails = []
-    next_page_token = None
+    next_page_token = start_page_token  # optional resume token from prior run
     fetched = 0
     while fetched < max_total:
         kwargs = {
@@ -269,7 +286,7 @@ def get_job_emails(service, query=None, max_total=4000):
         next_page_token = results.get("nextPageToken")
         if not next_page_token:
             break
-    return emails
+    return emails, next_page_token
 
 _bedrock_client = None
 
@@ -316,62 +333,76 @@ Email body snippet (trimmed): {body_snippet}
 Only output the JSON object.
 """
 
-    try:
-        llm_start = time.time()
-        client = get_bedrock_client()
-        model_id = os.getenv(
-            "BEDROCK_MODEL_ID",
-            "anthropic.claude-3-haiku-20240307-v1:0",
-        )
-        payload = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 400,
-            "temperature": 0,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt}
-                    ],
-                }
-            ],
-        }
+    llm_start = time.time()
+    client = get_bedrock_client()
+    model_id = choose_model(subject, body_snippet)
+    print(f"[Bedrock] using model={model_id}")
+    payload = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 400,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ],
+            }
+        ],
+    }
 
-        response = client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(payload).encode("utf-8"),
-            contentType="application/json",
-            accept="application/json",
-        )
-        raw_body = response["body"].read()
-        model_json = json.loads(raw_body)
-        content = model_json.get("content", [])
-        text = ""
-        if content and isinstance(content, list):
-            first = content[0]
-            text = first.get("text", "") if isinstance(first, dict) else ""
-
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        json_text = text[start:end] if start != -1 and end != 0 else text
+    for attempt in range(4):  # simple retry for throttling
         try:
-            data = json.loads(json_text)
-        except Exception as e:
-            print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
-            data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
-        print(f"Bedrock time: {time.time() - llm_start:.2f} seconds")
-        return data
-    except Exception as e:
-        print("Warning: Could not parse JSON from LLM output:", str(e))
-        return {
-            "relevant": False,
-            "reason": "Parsing failed",
-            "jobs": [],
-            "error": "Parsing failed",
-        }
+            # Slightly longer pause to reduce throttling
+            time.sleep(2.0 + random.random() * 1.0)
+            response = client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(payload).encode("utf-8"),
+                contentType="application/json",
+                accept="application/json",
+            )
+            raw_body = response["body"].read()
+            model_json = json.loads(raw_body)
+            content = model_json.get("content", [])
+            text = ""
+            if content and isinstance(content, list):
+                first = content[0]
+                text = first.get("text", "") if isinstance(first, dict) else ""
 
-# Blacklist for obvious non-job junk
-blacklist_keywords = load_blacklist()
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            json_text = text[start:end] if start != -1 and end != 0 else text
+            try:
+                data = json.loads(json_text)
+            except Exception as e:
+                print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
+                data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
+            elapsed = time.time() - llm_start
+            print(f"[Bedrock] success model={model_id} time={elapsed:.2f}s")
+            log_event("bedrock_success", model=model_id, elapsed_s=elapsed)
+            return data
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            msg = e.response.get("Error", {}).get("Message", "")
+            req_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
+            print(f"[Bedrock] attempt {attempt+1} failed: code={code} msg={msg} req_id={req_id}")
+            log_event("bedrock_error", attempt=attempt + 1, code=code, msg=msg, req_id=req_id)
+            if code == "ThrottlingException" and attempt < 3:
+                # exponential-ish backoff with jitter
+                time.sleep(2.0 * (attempt + 1) + random.random())
+                continue
+            break
+        except Exception as e:
+            print(f"[Bedrock] attempt {attempt+1} failed: {e}")
+            log_event("bedrock_error", attempt=attempt + 1, error=str(e))
+            break
+
+    return {
+        "relevant": False,
+        "reason": "Parsing failed",
+        "jobs": [],
+        "error": "Parsing failed",
+    }
 
 def contains_blacklist_keywords(mail, blacklist_keywords):
     # Only filter on subject and sender
@@ -384,6 +415,94 @@ job_like_keywords = [
     "position", "role", "career", "candidate", "hiring",
     "recruit", "recruiter", "opening"
 ]
+
+HAIKU_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+SONNET_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+def choose_model(subject: str, body_snippet: str) -> str:
+    """Send easy/short/obvious emails to Haiku, tougher ones to Sonnet."""
+    subj = (subject or "").lower()
+    body = (body_snippet or "").lower()
+    text = subj + " " + body
+    job_words = ("job", "application", "applied", "interview", "offer", "position", "role", "recruit", "hiring")
+    has_job_word = any(w in text for w in job_words)
+    is_long = len(body) > 1000  # modest threshold to route some to Sonnet
+    has_many_lines = body.count("\n") > 8
+    looks_weird = "unsubscribe" in text or "newsletter" in text
+    # Send Sonnet if it looks long/noisy/ambiguous; otherwise Haiku.
+    return SONNET_ID if (is_long or has_many_lines or (not has_job_word) or looks_weird) else HAIKU_ID
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+def clean_job_title(raw_title: str, sender: str) -> str:
+    """
+    Strip out titles that are clearly the sender/your name or an email address.
+    This avoids saving your own name (or the recruiter name) as the job title.
+    """
+    title = (raw_title or "").strip()
+    if not title:
+        return ""
+    # Drop email-looking strings entirely.
+    if "@" in title:
+        return ""
+    sender_text = sender or ""
+    sender_name = sender_text.split("<")[0].replace('"', "").strip()
+    sender_local = ""
+    if "@" in sender_text:
+        sender_local = sender_text.split("@")[0].split("<")[-1].strip()
+    user_name = os.getenv("JOBAPPS_USER_NAME", "").strip()
+    for candidate in (sender_name, sender_local, user_name):
+        if candidate and _norm(candidate) == _norm(title):
+            return ""
+    return title
+
+def clean_company(raw_company: str, sender: str) -> str:
+    """Strip company values that are obviously just a person name or email."""
+    company = (raw_company or "").strip()
+    if not company:
+        return ""
+    if "@" in company:
+        return ""
+    sender_text = sender or ""
+    sender_name = sender_text.split("<")[0].replace('"', "").strip()
+    sender_local = ""
+    if "@" in sender_text:
+        sender_local = sender_text.split("@")[0].split("<")[-1].strip()
+    user_name = os.getenv("JOBAPPS_USER_NAME", "").strip()
+    for candidate in (sender_name, sender_local, user_name):
+        if candidate and _norm(candidate) == _norm(company):
+            return ""
+    return company
+
+def infer_title_from_subject(subject: str, company: str = "") -> str:
+    """Try to backfill a title from the subject if the model returns blank."""
+    subj = (subject or "").strip()
+    if not subj:
+        return ""
+    # Remove company mention if present to reduce noise.
+    if company:
+        subj = re.sub(re.escape(company), "", subj, flags=re.IGNORECASE).strip(" |-:[]()")
+    patterns = [
+        r"interview for (.+)",
+        r"application for (.+)",
+        r"applied for (.+)",
+        r"role:? (.+)",
+        r"position:? (.+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, subj, flags=re.IGNORECASE)
+        if m:
+            guess = m.group(1).strip(" |-:[]()\"'")
+            if guess:
+                return guess
+    # Fallback: take the part before separators.
+    for sep in ["|", "-", "–", ":"]:
+        if sep in subj:
+            chunk = subj.split(sep)[0].strip(" |-:[]()\"'")
+            if chunk:
+                return chunk
+    return subj
 
 def looks_job_related(mail):
     text = (mail.get("subject", "") + " " + mail.get("body", "")).lower()
@@ -410,7 +529,17 @@ def process_email(mail, idx):
         )
         return (idx, mail, llm_result)
     except Exception as e:
-        ...
+        print(f"LLM error for email {idx}: {e}")
+        return (
+            idx,
+            mail,
+            {
+                "jobs": [],
+                "relevant": False,
+                "reason": str(e),
+                "error": str(e),
+            },
+        )
 
 
 
@@ -419,7 +548,28 @@ def main():
     service = authenticate_gmail()
     conn = get_conn()
 
-    emails = get_job_emails(service, max_total=4000)
+    # Read the most recent processed ID (if any) so we can stop when we reach it
+    last_id = None
+    if os.path.exists("last_processed_id.txt"):
+        with open("last_processed_id.txt", "r") as f:
+            last_id = f.read().strip() or None
+        if last_id:
+            print(f"Last processed email ID: {last_id}")
+        else:
+            print("last_processed_id.txt is empty; will process all fetched emails.")
+    else:
+        print("No last_processed_id.txt found; will process all fetched emails.")
+
+    # Keep fetch size aligned with the intended batch size; resume from stored page token if present
+    start_page_token = None
+    token_path = "next_page_token.txt"
+    if os.path.exists(token_path):
+        with open(token_path, "r") as f:
+            start_page_token = f.read().strip() or None
+        if start_page_token:
+            print(f"Resuming from stored page token.")
+
+    emails, new_page_token = get_job_emails(service, max_total=50, start_page_token=start_page_token)
 
     existing_ids = load_existing_ids(conn)
 
@@ -428,7 +578,11 @@ def main():
     skipped_blacklist = 0
     skipped_prefilter = 0
     for idx, mail in enumerate(emails, 1):
-        # Temporarily disable duplicate skip to reprocess all emails
+        # Stop if we reach the last processed ID from the previous run
+        if last_id and mail['id'] == last_id:
+            print("Reached last processed email. Stopping this batch.")
+            break
+        # Skip already-processed emails
         if mail['id'] in existing_ids:
             skipped_dupe += 1
             continue
@@ -442,12 +596,15 @@ def main():
     output_rows = []
     start_all = time.time()
     skipped_not_relevant = 0
-    with ThreadPoolExecutor(max_workers=6) as executor:  # adjust concurrency
+    error_counts = {}
+    with ThreadPoolExecutor(max_workers=1) as executor:  # adjust concurrency
         future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
         for future in as_completed(future_to_idx):
             idx, mail, llm_result = future.result()
             if not llm_result.get("relevant", True):
                 skipped_not_relevant += 1
+                key = llm_result.get("error") or llm_result.get("reason") or "not_relevant"
+                error_counts[key] = error_counts.get(key, 0) + 1
                 continue
             jobs = llm_result.get("jobs", [])
             if not isinstance(jobs, list):
@@ -462,16 +619,23 @@ def main():
                 }]
             applications = []
             for job in jobs:
+                cleaned_company = clean_company(job.get("company", ""), mail.get("from", ""))
+                cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
+                if not cleaned_title:
+                    inferred = infer_title_from_subject(mail.get("subject", ""), cleaned_company)
+                    cleaned_title = clean_job_title(inferred, mail.get("from", ""))
                 applications.append(
                     {
-                        "company": job.get("company", ""),
-                        "job_title": job.get("job_title", ""),
+                        "company": cleaned_company,
+                        "job_title": cleaned_title,
                         "status": clean_status(job.get("status", "")),
                         "parsed_date": job.get("date", ""),
                         "reason": llm_result.get("reason", ""),
                         "error": llm_result.get("error", ""),
                     }
                 )
+            key = llm_result.get("error") or "ok"
+            error_counts[key] = error_counts.get(key, 0) + 1
             row = {
                 "id": mail['id'],
                 "email_num": idx,
@@ -490,6 +654,8 @@ def main():
             }
             output_rows.append(row)
             existing_ids.add(mail['id'])
+            # Pause slightly longer between emails to reduce throttling
+            time.sleep(3.0 + random.random() * 1.0)
             if idx % 10 == 0:
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
@@ -501,8 +667,25 @@ def main():
     if output_rows:
         save_rows(conn, output_rows)
         print(f"Saved {len(output_rows)} rows into {DB_PATH}")
+        # Persist the oldest email ID in this batch so next run skips down to it
+        oldest_id = emails_to_process[-1][0]['id'] if emails_to_process else None
+        if oldest_id:
+            with open("last_processed_id.txt", "w") as f:
+                f.write(oldest_id)
+            print(f"Saved oldest processed email ID: {oldest_id}")
     else:
         print("No new rows to save to the database.")
+
+    # Persist the next page token (if any) so next run can resume deeper
+    with open(token_path, "w") as f:
+        f.write(new_page_token or "")
+    if new_page_token:
+        print("Saved next page token for next run.")
+    else:
+        print("No next page token; reached end of available pages for this query.")
+
+    print("Error summary:", error_counts)
+    log_event("run_summary", errors=error_counts)
 
     print(
         f"Run summary: fetched {len(emails)}; "
@@ -515,5 +698,5 @@ def main():
 if __name__ == "__main__":
     while True:
         main()
-        print("Waiting 2 minutes before next batch...")
-        time.sleep(120)
+        print("Waiting 5 minutes before next batch...")
+        time.sleep(300)

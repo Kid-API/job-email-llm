@@ -9,3 +9,4 @@ Test_Job_Apps_Dedupe.pdf
 jobs.db
 jobs.db-wal
 jobs.db-shm
+run.log
