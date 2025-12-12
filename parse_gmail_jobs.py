@@ -336,6 +336,7 @@ Only output the JSON object.
     llm_start = time.time()
     client = get_bedrock_client()
     model_id = choose_model(subject, body_snippet)
+    print(f"[Bedrock] using model={model_id}")
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 400,
@@ -425,9 +426,11 @@ def choose_model(subject: str, body_snippet: str) -> str:
     text = subj + " " + body
     job_words = ("job", "application", "applied", "interview", "offer", "position", "role", "recruit", "hiring")
     has_job_word = any(w in text for w in job_words)
-    is_long = len(body) > 1200
+    is_long = len(body) > 1000  # modest threshold to route some to Sonnet
+    has_many_lines = body.count("\n") > 8
     looks_weird = "unsubscribe" in text or "newsletter" in text
-    return SONNET_ID if is_long or (not has_job_word) or looks_weird else HAIKU_ID
+    # Send Sonnet if it looks long/noisy/ambiguous; otherwise Haiku.
+    return SONNET_ID if (is_long or has_many_lines or (not has_job_word) or looks_weird) else HAIKU_ID
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
@@ -471,6 +474,35 @@ def clean_company(raw_company: str, sender: str) -> str:
         if candidate and _norm(candidate) == _norm(company):
             return ""
     return company
+
+def infer_title_from_subject(subject: str, company: str = "") -> str:
+    """Try to backfill a title from the subject if the model returns blank."""
+    subj = (subject or "").strip()
+    if not subj:
+        return ""
+    # Remove company mention if present to reduce noise.
+    if company:
+        subj = re.sub(re.escape(company), "", subj, flags=re.IGNORECASE).strip(" |-:[]()")
+    patterns = [
+        r"interview for (.+)",
+        r"application for (.+)",
+        r"applied for (.+)",
+        r"role:? (.+)",
+        r"position:? (.+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, subj, flags=re.IGNORECASE)
+        if m:
+            guess = m.group(1).strip(" |-:[]()\"'")
+            if guess:
+                return guess
+    # Fallback: take the part before separators.
+    for sep in ["|", "-", "–", ":"]:
+        if sep in subj:
+            chunk = subj.split(sep)[0].strip(" |-:[]()\"'")
+            if chunk:
+                return chunk
+    return subj
 
 def looks_job_related(mail):
     text = (mail.get("subject", "") + " " + mail.get("body", "")).lower()
@@ -537,7 +569,7 @@ def main():
         if start_page_token:
             print(f"Resuming from stored page token.")
 
-    emails, new_page_token = get_job_emails(service, max_total=75, start_page_token=start_page_token)
+    emails, new_page_token = get_job_emails(service, max_total=50, start_page_token=start_page_token)
 
     existing_ids = load_existing_ids(conn)
 
@@ -550,10 +582,10 @@ def main():
         if last_id and mail['id'] == last_id:
             print("Reached last processed email. Stopping this batch.")
             break
-        # Temporarily disable duplicate skip to reprocess all emails
-       # if mail['id'] in existing_ids:
-       #     skipped_dupe += 1
-       #    continue
+        # Skip already-processed emails
+        if mail['id'] in existing_ids:
+            skipped_dupe += 1
+            continue
         if contains_blacklist_keywords(mail, blacklist_keywords):
             skipped_blacklist += 1
             continue
@@ -589,6 +621,9 @@ def main():
             for job in jobs:
                 cleaned_company = clean_company(job.get("company", ""), mail.get("from", ""))
                 cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
+                if not cleaned_title:
+                    inferred = infer_title_from_subject(mail.get("subject", ""), cleaned_company)
+                    cleaned_title = clean_job_title(inferred, mail.get("from", ""))
                 applications.append(
                     {
                         "company": cleaned_company,
@@ -619,8 +654,8 @@ def main():
             }
             output_rows.append(row)
             existing_ids.add(mail['id'])
-            # Pause slightly between emails to reduce throttling
-            time.sleep(1.5 + random.random() * 0.5)
+            # Pause slightly longer between emails to reduce throttling
+            time.sleep(3.0 + random.random() * 1.0)
             if idx % 10 == 0:
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
