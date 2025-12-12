@@ -1,55 +1,77 @@
 # Job Application Dashboard
 
-A simple Flask + SQLite dashboard for tracking job-application emails. It fetches your Gmail messages, extracts companies/roles/statuses with an LLM, stores them in `jobs.db`, and shows a filterable/paginated UI.
+A Flask app that parses job-related Gmail threads, uses Bedrock (Anthropic) to extract company/title/status, and shows a dashboard backed by SQLite.
 
-## Requirements
-- Python 3.11+ (repo currently uses 3.14 in a venv)
-- `pip install -r requirements.txt` (if present) or install the libs you use: `flask`, `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2`, plus your LLM CLI (e.g., `ollama`)
-- Gmail OAuth files: `credentials.json` (token saved to `token.pickle` after first auth)
+## Prereqs
+- Python 3.11+
+- AWS CLI configured (for ECR/Bedrock)
+- Docker (for image builds)
+- Gmail OAuth files: `credentials.json` and `token.pickle` (keep out of git)
+- Bedrock access (Anthropic Haiku/Sonnet)
 
-## Setup
+## Local setup
 ```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt   # or install deps manually
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+python app.py   # http://127.0.0.1:5000
+```
+First run of `parse_gmail_jobs.py` will open a browser to create `token.pickle`.
+
+## Docker
+Build and run locally:
+```bash
+docker build -t job-apps:latest .
+docker run --rm -p 5000:5000 \
+  -v "$(pwd)/credentials.json:/app/credentials.json:ro" \
+  -v "$(pwd)/token.pickle:/app/token.pickle" \
+  -v "$(pwd)/jobs.db:/app/jobs.db" \
+  job-apps:latest
+```
+Then open http://localhost:5000.
+
+## Push to ECR (example)
+```bash
+REGION=us-east-2
+ACCOUNT=934538657202
+REPO=job-apps
+
+docker build --platform linux/amd64 -t ${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:latest .
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin ${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com
+docker push ${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPO}:latest
 ```
 
-## Ingest emails
-Runs Gmail fetch + LLM parsing into SQLite (`jobs.db`).
+## Run on EC2
+On the instance:
 ```bash
-python parse_gmail_jobs.py
-```
-Key options are in the script:
-- `max_total` (default 4000) limits how many Gmail messages to fetch.
-- Gmail query defaults to `after:2024/03/20` with subject filters; edit in `get_job_emails`.
-- Duplicate skip is on (uses Gmail message ID).
-- Blacklist terms live in `blacklist.txt` (one term/phrase per line, no quotes).
+aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 934538657202.dkr.ecr.us-east-2.amazonaws.com
+docker pull 934538657202.dkr.ecr.us-east-2.amazonaws.com/job-apps:latest
 
-## Run the UI
-Starts the Flask app at `http://127.0.0.1:5000/` (or `localhost:5000`).
-```bash
-python app.py
+docker stop job-apps 2>/dev/null && docker rm job-apps 2>/dev/null
+docker run -d --name job-apps -p 80:5000 \
+  -v "$HOME/credentials.json:/app/credentials.json:ro" \
+  -v "$HOME/token.pickle:/app/token.pickle" \
+  -v "$HOME/jobs.db:/app/jobs.db" \
+  934538657202.dkr.ecr.us-east-2.amazonaws.com/job-apps:latest
 ```
-UI features:
-- Filter by status, exclude statuses, hide unknowns
-- Date range filters (YYYY-MM-DD)
-- Sort by date/company/status
-- Pagination with configurable page size
-- Rows with blank company AND job title are hidden
+Ensure the security group allows port 80 (or 5000 if you map that) from your IP.
 
-## Normalize company names (optional)
-Uses your local LLM (Ollama) to clean capitalization.
+## Gmail parsing
+Run once inside the container:
 ```bash
-python scripts/normalize_company_names.py        # dry-run
-python scripts/normalize_company_names.py --apply  # write changes
+docker exec job-apps python /app/parse_gmail_jobs.py
+```
+Scheduled (cron on EC2):
+```
+0 1 * * * /usr/bin/docker exec job-apps python /app/parse_gmail_jobs.py >> $HOME/job_app_cron.log 2>&1
 ```
 
-## Database notes
-- Tables: `emails` (one row per Gmail message) and `applications` (one row per job mention, FK to emails).
-- SQLite WAL files (`jobs.db-wal`, `jobs.db-shm`) should stay untracked; add them to `.gitignore`.
-- If the DB is empty, re-run ingestion to repopulate.
+## Data & secrets
+- DB lives at `/home/ubuntu/jobs.db` on EC2 (mounted to `/app/jobs.db`).
+- Do NOT commit `credentials.json`, `token.pickle`, `jobs.db`, `run.log`.
 
-## Common issues
-- `ModuleNotFoundError: status_utils`: ensure `status_utils.py` is in the repo root (it is) and that `parse_gmail_jobs.py` is run from the project root.
-- `no such table: applications`: run `app.py` or `parse_gmail_jobs.py` once to create tables, or restore a backup.
-- 403 in browser: try `http://localhost:5000/`, disable VPN/proxy, or change port in `app.py`.
+## Troubleshooting
+- Check logs: `docker logs -f job-apps`
+- Verify mounts: `docker exec job-apps ls -l /app/credentials.json /app/token.pickle /app/jobs.db`
+- If “refused to connect”: confirm port mapping (`docker ps`), app binds to `0.0.0.0`, and SG allows the port.
