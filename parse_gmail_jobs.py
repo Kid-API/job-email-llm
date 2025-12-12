@@ -9,6 +9,7 @@ import boto3
 import sys
 import random
 import logging
+import re
 from email.utils import parsedate_to_datetime
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -334,10 +335,7 @@ Only output the JSON object.
 
     llm_start = time.time()
     client = get_bedrock_client()
-    model_id = os.getenv(
-        "BEDROCK_MODEL_ID",
-        "anthropic.claude-3-haiku-20240307-v1:0",
-    )
+    model_id = choose_model(subject, body_snippet)
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 400,
@@ -416,6 +414,45 @@ job_like_keywords = [
     "position", "role", "career", "candidate", "hiring",
     "recruit", "recruiter", "opening"
 ]
+
+HAIKU_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+SONNET_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+def choose_model(subject: str, body_snippet: str) -> str:
+    """Send easy/short/obvious emails to Haiku, tougher ones to Sonnet."""
+    subj = (subject or "").lower()
+    body = (body_snippet or "").lower()
+    text = subj + " " + body
+    job_words = ("job", "application", "applied", "interview", "offer", "position", "role", "recruit", "hiring")
+    has_job_word = any(w in text for w in job_words)
+    is_long = len(body) > 1200
+    looks_weird = "unsubscribe" in text or "newsletter" in text
+    return SONNET_ID if is_long or (not has_job_word) or looks_weird else HAIKU_ID
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+def clean_job_title(raw_title: str, sender: str) -> str:
+    """
+    Strip out titles that are clearly the sender/your name or an email address.
+    This avoids saving your own name (or the recruiter name) as the job title.
+    """
+    title = (raw_title or "").strip()
+    if not title:
+        return ""
+    # Drop email-looking strings entirely.
+    if "@" in title:
+        return ""
+    sender_text = sender or ""
+    sender_name = sender_text.split("<")[0].replace('"', "").strip()
+    sender_local = ""
+    if "@" in sender_text:
+        sender_local = sender_text.split("@")[0].split("<")[-1].strip()
+    user_name = os.getenv("JOBAPPS_USER_NAME", "").strip()
+    for candidate in (sender_name, sender_local, user_name):
+        if candidate and _norm(candidate) == _norm(title):
+            return ""
+    return title
 
 def looks_job_related(mail):
     text = (mail.get("subject", "") + " " + mail.get("body", "")).lower()
@@ -532,10 +569,11 @@ def main():
                 }]
             applications = []
             for job in jobs:
+                cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
                 applications.append(
                     {
                         "company": job.get("company", ""),
-                        "job_title": job.get("job_title", ""),
+                        "job_title": cleaned_title,
                         "status": clean_status(job.get("status", "")),
                         "parsed_date": job.get("date", ""),
                         "reason": llm_result.get("reason", ""),
