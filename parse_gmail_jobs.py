@@ -585,10 +585,11 @@ def main():
 
     emails_to_process = []
     skipped_dupe = 0
-    skipped_thread = 0
+    skipped_thread_replaced = 0
     skipped_blacklist = 0
     skipped_prefilter = 0
-    threads_seen: set[str] = set()
+    threads_latest: dict[str, tuple[str, dict]] = {}
+    no_thread_emails: list[tuple[int, dict]] = []
     for idx, mail in enumerate(emails, 1):
         # Stop if we reach the last processed ID from the previous run
         if last_id and mail['id'] == last_id:
@@ -598,20 +599,28 @@ def main():
         if mail['id'] in existing_ids:
             skipped_dupe += 1
             continue
-        # Collapse multiple messages in the same thread; keep the first (newest) one
-        thread_id = mail.get("thread_id", "")
-        if thread_id:
-            if thread_id in threads_seen:
-                skipped_thread += 1
-                continue
-            threads_seen.add(thread_id)
         if contains_blacklist_keywords(mail, blacklist_keywords):
             skipped_blacklist += 1
             continue
         if not looks_job_related(mail):
             skipped_prefilter += 1
             continue
-        emails_to_process.append((mail, idx))
+        thread_id = mail.get("thread_id", "")
+        if thread_id:
+            iso = to_iso_date(mail.get("date", ""))
+            existing = threads_latest.get(thread_id)
+            if existing:
+                existing_iso = existing[0]
+                if iso > existing_iso:
+                    threads_latest[thread_id] = (iso, mail)
+                    skipped_thread_replaced += 1
+            else:
+                threads_latest[thread_id] = (iso, mail)
+        else:
+            no_thread_emails.append((idx, mail))
+    # Flatten chosen thread reps plus no-thread emails
+    emails_to_process = [(m, idx) for idx, m in no_thread_emails]
+    emails_to_process.extend([(pair[1], idx) for idx, pair in enumerate(threads_latest.values(), start=len(emails_to_process)+1)])
     output_rows = []
     start_all = time.time()
     skipped_not_relevant = 0
@@ -715,7 +724,7 @@ def main():
     print(
         f"Run summary: fetched {len(emails)}; "
         f"dupes skipped {skipped_dupe}; "
-        f"threads skipped {skipped_thread}; "
+        f"threads replaced {skipped_thread_replaced}; "
         f"blacklist skipped {skipped_blacklist}; "
         f"prefilter skipped {skipped_prefilter}; "
         f"LLM skipped {skipped_not_relevant}; "
