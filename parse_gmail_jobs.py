@@ -454,6 +454,24 @@ def clean_job_title(raw_title: str, sender: str) -> str:
             return ""
     return title
 
+def clean_company(raw_company: str, sender: str) -> str:
+    """Strip company values that are obviously just a person name or email."""
+    company = (raw_company or "").strip()
+    if not company:
+        return ""
+    if "@" in company:
+        return ""
+    sender_text = sender or ""
+    sender_name = sender_text.split("<")[0].replace('"', "").strip()
+    sender_local = ""
+    if "@" in sender_text:
+        sender_local = sender_text.split("@")[0].split("<")[-1].strip()
+    user_name = os.getenv("JOBAPPS_USER_NAME", "").strip()
+    for candidate in (sender_name, sender_local, user_name):
+        if candidate and _norm(candidate) == _norm(company):
+            return ""
+    return company
+
 def looks_job_related(mail):
     text = (mail.get("subject", "") + " " + mail.get("body", "")).lower()
     return any(word in text for word in job_like_keywords)
@@ -569,10 +587,11 @@ def main():
                 }]
             applications = []
             for job in jobs:
+                cleaned_company = clean_company(job.get("company", ""), mail.get("from", ""))
                 cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
                 applications.append(
                     {
-                        "company": job.get("company", ""),
+                        "company": cleaned_company,
                         "job_title": cleaned_title,
                         "status": clean_status(job.get("status", "")),
                         "parsed_date": job.get("date", ""),
