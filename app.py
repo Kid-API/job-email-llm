@@ -72,6 +72,7 @@ def ensure_tables(conn):
 @app.route("/")
 def home():
     status = request.args.get("status", "").strip()
+    search = request.args.get("search", "").strip()
     raw_exclude = request.args.get("exclude", "")
     exclude_statuses = [s.strip() for s in raw_exclude.split(",") if s.strip()]
     hide_unknown = request.args.get("hide_unknown", "") in ("1", "true", "yes", "on")
@@ -123,6 +124,12 @@ def home():
     if end_date_raw and valid_date(end_date_raw):
         where_clauses.append(f"{date_expr} <= ?")
         params.append(end_date_raw)
+    if search:
+        term = f"%{search.lower()}%"
+        where_clauses.append(
+            "(lower(a.company) LIKE ? OR lower(a.job_title) LIKE ? OR lower(e.subject) LIKE ?)"
+        )
+        params.extend([term, term, term])
 
     where = "WHERE " + " AND ".join(where_clauses)
 
@@ -194,6 +201,7 @@ def home():
         rows=rows,
         counts=counts,
         status=status,
+        search=search,
         exclude=raw_exclude,
         hide_unknown=hide_unknown,
         start_date=start_date_raw,
