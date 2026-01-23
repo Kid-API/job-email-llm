@@ -141,7 +141,7 @@ def home():
     )[0]["c"]
 
     rows = query(
-        f"""SELECT a.company, a.job_title, {status_expr} AS status, e.date_email, e.date_email_iso
+        f"""SELECT a.company, a.job_title, {status_expr} AS status, a.reason, e.date_email, e.date_email_iso
             FROM applications a
             JOIN emails e ON a.email_id = e.id
             {where}
@@ -166,6 +166,7 @@ def home():
             "company": r["company"],
             "job_title": r["job_title"],
             "status": r["status"],
+            "reason": r["reason"],
             "date_email": r["date_email"],
             "date_email_iso": r["date_email_iso"],
             "date_display": format_est(r["date_email_iso"]),

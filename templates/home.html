@@ -37,6 +37,7 @@
         <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=company&page_size={{ page_size }}">Company</a></th>
         <th>Job Title</th>
         <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=status&page_size={{ page_size }}">Status</a></th>
+        <th>Reason</th>
         <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=date&page_size={{ page_size }}">Email Date</a></th>
       </tr>
       {% for row in rows %}
@@ -44,6 +45,7 @@
           <td>{{ row["company"] }}</td>
           <td>{{ row["job_title"] }}</td>
           <td>{{ row["status"] }}</td>
+          <td>{{ row["reason"] }}</td>
           <td>{{ row["date_display"] }}</td>
         </tr>
       {% endfor %}

@@ -234,7 +234,7 @@ def load_blacklist(filename="blacklist.txt"):
 
 def get_job_emails(service, query=None, max_total=200, start_page_token=None):
     if not query:
-        query = "(subject:applied OR subject:application OR subject:interview OR subject:rejected) after:2024/03/20"
+        query = "(subject:applied OR subject:application OR subject:interview OR subject:offer OR subject:follow OR subject:update OR subject:decision OR subject:role OR \"thank you\" OR \"move forward\") after:2024/03/20"
     emails = []
     next_page_token = start_page_token  # optional resume token from prior run
     fetched = 0
@@ -305,7 +305,7 @@ def get_bedrock_client():
     return _bedrock_client
 
 
-def extract_job_status_claude(subject, body_snippet, platform="other", sender=""):
+def extract_job_status_claude(subject, body_snippet, platform="other", sender="", force_model_id=None):
     prompt = f"""
 You are a filter and parser for job application emails.
 First, decide if this email is about a job (application, interview, offer, rejection, recruiter outreach, etc.).
@@ -336,7 +336,7 @@ Only output the JSON object.
 
     llm_start = time.time()
     client = get_bedrock_client()
-    model_id = choose_model(subject, body_snippet, sender=sender, platform=platform)
+    model_id = force_model_id or choose_model(subject, body_snippet, sender=sender, platform=platform)
     print(f"[Bedrock] using model={model_id}")
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
@@ -355,7 +355,7 @@ Only output the JSON object.
     for attempt in range(4):  # simple retry for throttling
         try:
             # Slightly longer pause to reduce throttling
-            time.sleep(2.0 + random.random() * 1.0)
+            time.sleep(3.0 + random.random() * 2.0)  # 3-5s between calls
             response = client.invoke_model(
                 modelId=model_id,
                 body=json.dumps(payload).encode("utf-8"),
@@ -381,6 +381,8 @@ Only output the JSON object.
             elapsed = time.time() - llm_start
             print(f"[Bedrock] success model={model_id} time={elapsed:.2f}s")
             log_event("bedrock_success", model=model_id, elapsed_s=elapsed)
+            if isinstance(data, dict):
+                data["_model_id"] = model_id
             return data
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
@@ -390,7 +392,7 @@ Only output the JSON object.
             log_event("bedrock_error", attempt=attempt + 1, code=code, msg=msg, req_id=req_id)
             if code == "ThrottlingException" and attempt < 3:
                 # exponential-ish backoff with jitter
-                time.sleep(2.0 * (attempt + 1) + random.random())
+                time.sleep(4.0 * (attempt + 1) + random.random() * 2.0)  # 4/8/12s-ish
                 continue
             break
         except Exception as e:
@@ -537,6 +539,25 @@ def process_email(mail, idx):
             mail.get('platform', 'other'),
             mail.get('from', ''),
         )
+        # If the first pass (non-Sonnet) yielded only missing/unknown titles, retry with Sonnet
+        def titles_missing(result):
+            jobs = result.get("jobs") or []
+            if not jobs:
+                return True
+            for j in jobs:
+                title = (j.get("job_title") or "").strip().lower()
+                if title and title != "unknown":
+                    return False
+            return True
+
+        if llm_result.get("_model_id") != SONNET_ID and titles_missing(llm_result):
+            llm_result = extract_job_status_claude(
+                mail.get('subject_trimmed', mail.get('subject', '')),
+                mail.get('body_snippet', mail.get('body', '')),
+                mail.get('platform', 'other'),
+                mail.get('from', ''),
+                force_model_id=SONNET_ID,
+            )
         return (idx, mail, llm_result)
     except Exception as e:
         print(f"LLM error for email {idx}: {e}")
@@ -579,7 +600,7 @@ def main():
         if start_page_token:
             print(f"Resuming from stored page token.")
 
-    emails, new_page_token = get_job_emails(service, max_total=50, start_page_token=start_page_token)
+    emails, new_page_token = get_job_emails(service, max_total=20, start_page_token=start_page_token)
 
     existing_ids = load_existing_ids(conn)
 
@@ -654,15 +675,21 @@ def main():
                 if not cleaned_title:
                     inferred = infer_title_from_subject(mail.get("subject", ""), cleaned_company)
                     cleaned_title = clean_job_title(inferred, mail.get("from", ""))
+                review_note = ""
                 if not cleaned_title:
-                    continue
+                    cleaned_title = "(unknown title - review)"
+                    review_note = "missing_title"
+                parsed_date = job.get("date", "") or to_iso_date(mail.get("date", ""))
+                reason = llm_result.get("reason", "") or review_note
+                if review_note and llm_result.get("reason"):
+                    reason = f"{llm_result.get('reason')} | {review_note}"
                 applications.append(
                     {
                         "company": cleaned_company,
                         "job_title": cleaned_title,
                         "status": clean_status(job.get("status", "")),
-                        "parsed_date": job.get("date", ""),
-                        "reason": llm_result.get("reason", ""),
+                        "parsed_date": parsed_date,
+                        "reason": reason,
                         "error": llm_result.get("error", ""),
                     }
                 )
@@ -689,7 +716,7 @@ def main():
             output_rows.append(row)
             existing_ids.add(mail['id'])
             # Pause slightly longer between emails to reduce throttling
-            time.sleep(3.0 + random.random() * 1.0)
+            time.sleep(6.0 + random.random() * 2.0)  # 6-8s pacing to ease throttling
             if idx % 10 == 0:
                 print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
@@ -731,7 +758,4 @@ def main():
         f"saved {len(output_rows)}"
     )
 if __name__ == "__main__":
-    while True:
-        main()
-        print("Waiting 5 minutes before next batch...")
-        time.sleep(300)
+    main()
