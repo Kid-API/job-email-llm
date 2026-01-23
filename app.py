@@ -25,6 +25,7 @@ def ensure_tables(conn):
         CREATE TABLE IF NOT EXISTS emails (
             id TEXT PRIMARY KEY,
             email_num INTEGER,
+            thread_id TEXT,
             subject TEXT,
             sender TEXT,
             date_email TEXT,
@@ -42,6 +43,8 @@ def ensure_tables(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
     if "date_email_iso" not in cols:
         conn.execute("ALTER TABLE emails ADD COLUMN date_email_iso TEXT")
+    if "thread_id" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN thread_id TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS applications (
@@ -141,7 +144,7 @@ def home():
     )[0]["c"]
 
     rows = query(
-        f"""SELECT a.company, a.job_title, {status_expr} AS status, a.reason, e.date_email, e.date_email_iso
+        f"""SELECT a.company, a.job_title, {status_expr} AS status, a.reason, e.date_email, e.date_email_iso, e.thread_id
             FROM applications a
             JOIN emails e ON a.email_id = e.id
             {where}
@@ -169,6 +172,7 @@ def home():
             "reason": r["reason"],
             "date_email": r["date_email"],
             "date_email_iso": r["date_email_iso"],
+            "thread_id": r["thread_id"],
             "date_display": format_est(r["date_email_iso"]),
         }
         for r in rows

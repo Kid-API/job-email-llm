@@ -39,14 +39,30 @@
         <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=status&page_size={{ page_size }}">Status</a></th>
         <th>Reason</th>
         <th><a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort=date&page_size={{ page_size }}">Email Date</a></th>
+        <th>Gmail</th>
       </tr>
       {% for row in rows %}
         <tr>
-          <td>{{ row["company"] }}</td>
-          <td>{{ row["job_title"] }}</td>
+          <td>
+            {{ row["company"] }}
+            {% if row["company"] %}
+              <button type="button" onclick='copyText({{ row["company"]|tojson }})'>Copy</button>
+            {% endif %}
+          </td>
+          <td>
+            {{ row["job_title"] }}
+            {% if row["job_title"] %}
+              <button type="button" onclick='copyText({{ row["job_title"]|tojson }})'>Copy</button>
+            {% endif %}
+          </td>
           <td>{{ row["status"] }}</td>
           <td>{{ row["reason"] }}</td>
           <td>{{ row["date_display"] }}</td>
+          <td>
+            {% if row["thread_id"] %}
+              <a href="https://mail.google.com/mail/u/0/#inbox/{{ row['thread_id'] }}" target="_blank" rel="noopener">Open</a>
+            {% endif %}
+          </td>
         </tr>
       {% endfor %}
     </table>
@@ -60,5 +76,19 @@
         <a href="?status={{ status }}&exclude={{ exclude }}&start_date={{ start_date }}&end_date={{ end_date }}&hide_unknown={{ 1 if hide_unknown else '' }}&sort={{ sort }}&page={{ page + 1 }}&page_size={{ page_size }}">Next</a>
       {% endif %}
     </div>
+    <script>
+      function copyText(text) {
+        if (!navigator.clipboard) {
+          const input = document.createElement('textarea');
+          input.value = text;
+          document.body.appendChild(input);
+          input.select();
+          document.execCommand('copy');
+          document.body.removeChild(input);
+          return;
+        }
+        navigator.clipboard.writeText(text);
+      }
+    </script>
   </body>
 </html>

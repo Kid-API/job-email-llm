@@ -77,6 +77,7 @@ def ensure_schema(conn):
         CREATE TABLE IF NOT EXISTS emails (
             id TEXT PRIMARY KEY,
             email_num INTEGER,
+            thread_id TEXT,
             subject TEXT,
             sender TEXT,
             date_email TEXT,
@@ -95,6 +96,8 @@ def ensure_schema(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(emails)")}
     if "date_email_iso" not in cols:
         conn.execute("ALTER TABLE emails ADD COLUMN date_email_iso TEXT")
+    if "thread_id" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN thread_id TEXT")
     # Applications table stores one row per job mention, linked back to emails
     conn.execute(
         """
@@ -145,11 +148,12 @@ def save_rows(conn, rows):
         conn.executemany(
             """
             INSERT INTO emails
-            (id, email_num, subject, sender, date_email, date_email_iso,
+            (id, email_num, thread_id, subject, sender, date_email, date_email_iso,
              company, job_title, status, parsed_date, reason, error)
-            VALUES (:id, :email_num, :subject, :from, :date_email, :date_email_iso,
+            VALUES (:id, :email_num, :thread_id, :subject, :from, :date_email, :date_email_iso,
                     :company, :job_title, :status, :parsed_date, :reason, :error)
             ON CONFLICT(id) DO UPDATE SET
+                thread_id=excluded.thread_id,
                 subject=excluded.subject,
                 sender=excluded.sender,
                 date_email_iso=excluded.date_email_iso,
@@ -700,6 +704,7 @@ def main():
             row = {
                 "id": mail['id'],
                 "email_num": idx,
+                "thread_id": mail.get("thread_id", ""),
                 "subject": mail['subject'],
                 "from": mail['from'],
                 "date_email": mail['date'],
