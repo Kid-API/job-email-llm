@@ -1,4 +1,5 @@
 import os
+import argparse
 import pickle
 import base64
 import sqlite3
@@ -13,11 +14,10 @@ import re
 from email.utils import parsedate_to_datetime
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from googleapiclient.discovery import build
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-from status_utils import clean_status
+from status_utils import clean_reason, clean_status
 
 
 # Paths and database setup
@@ -32,6 +32,55 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+BEDROCK_MIN_GAP_SECONDS = max(0.0, _env_float("BEDROCK_MIN_GAP_SECONDS", 10.0))
+BEDROCK_MAX_ATTEMPTS = max(1, _env_int("BEDROCK_MAX_ATTEMPTS", 4))
+BEDROCK_BACKOFF_BASE_SECONDS = max(1.0, _env_float("BEDROCK_BACKOFF_BASE_SECONDS", 6.0))
+BEDROCK_MAX_OUTPUT_TOKENS = max(80, _env_int("BEDROCK_MAX_OUTPUT_TOKENS", 220))
+BEDROCK_BODY_SNIPPET_CHARS = max(300, _env_int("BEDROCK_BODY_SNIPPET_CHARS", 700))
+BEDROCK_ENABLE_SONNET = _env_bool("BEDROCK_ENABLE_SONNET", False)
+BEDROCK_SONNET_TOKEN_THROTTLE_SWITCH = _env_bool(
+    "BEDROCK_SONNET_TOKEN_THROTTLE_SWITCH", True
+)
+BEDROCK_MODEL_OVERRIDE = (os.getenv("BEDROCK_MODEL_OVERRIDE") or "").strip()
+BEDROCK_AUTO_WAIT_ON_DAILY_QUOTA = _env_bool(
+    "BEDROCK_AUTO_WAIT_ON_DAILY_QUOTA", True
+)
+BEDROCK_DAILY_QUOTA_WAIT_SECONDS = max(
+    60, _env_int("BEDROCK_DAILY_QUOTA_WAIT_SECONDS", 1800)
+)
+BEDROCK_DAILY_QUOTA_MAX_WAIT_CYCLES = max(
+    1, _env_int("BEDROCK_DAILY_QUOTA_MAX_WAIT_CYCLES", 48)
+)
+GMAIL_RESUME_OLDER_PAGES = _env_bool("GMAIL_RESUME_OLDER_PAGES", False)
 
 
 def log_event(event, **kwargs):
@@ -68,6 +117,33 @@ def load_existing_ids(conn):
     ensure_schema(conn)
     rows = conn.execute("SELECT id FROM emails").fetchall()
     return {r[0] for r in rows}
+
+
+def backfill_status_and_reason(conn):
+    """
+    Normalize existing application status/reason values in-place.
+
+    This avoids a full Bedrock reparse when you only need cleaner labels.
+    """
+    rows = conn.execute(
+        "SELECT id, status, reason FROM applications"
+    ).fetchall()
+    updates = []
+    for row in rows:
+        app_id = row[0]
+        old_status = row[1] or ""
+        old_reason = row[2] or ""
+        new_status = clean_status(old_status)
+        new_reason = clean_reason(old_reason, new_status)
+        if old_status != new_status or old_reason != new_reason:
+            updates.append((new_status, new_reason, app_id))
+    if updates:
+        with conn:
+            conn.executemany(
+                "UPDATE applications SET status = ?, reason = ? WHERE id = ?",
+                updates,
+            )
+        print(f"Backfilled {len(updates)} application rows with normalized status/reason.")
 
 
 def ensure_schema(conn):
@@ -273,7 +349,7 @@ def get_job_emails(service, query=None, max_total=200, start_page_token=None):
             platform = detect_platform(sender)
             subject_trimmed = (subject or "")[:250]
             # Keep body short for privacy/cost; LinkedIn often puts the key info up top
-            body_snippet = (body or "")[:1200]
+            body_snippet = (body or "")[:BEDROCK_BODY_SNIPPET_CHARS]
             emails.append({
                 'id': msg['id'],
                 'thread_id': msg_detail.get('threadId', ''),
@@ -294,13 +370,46 @@ def get_job_emails(service, query=None, max_total=200, start_page_token=None):
     return emails, next_page_token
 
 _bedrock_client = None
+_bedrock_rate_lock = threading.Lock()
+_bedrock_next_allowed_at = 0.0
+_bedrock_daily_quota_exhausted = False
+
+
+def _wait_for_bedrock_slot():
+    """Serialize Bedrock calls and ensure a minimum gap between invocations."""
+    global _bedrock_next_allowed_at
+    sleep_s = 0.0
+    with _bedrock_rate_lock:
+        now = time.monotonic()
+        sleep_s = max(0.0, _bedrock_next_allowed_at - now)
+        reserved_at = max(now, _bedrock_next_allowed_at)
+        _bedrock_next_allowed_at = reserved_at + BEDROCK_MIN_GAP_SECONDS
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
+
+def _extend_bedrock_backoff(attempt: int) -> float:
+    """Push the next allowed Bedrock time forward with exponential backoff + jitter."""
+    global _bedrock_next_allowed_at
+    backoff = (BEDROCK_BACKOFF_BASE_SECONDS * (2 ** attempt)) + random.uniform(
+        0, BEDROCK_BACKOFF_BASE_SECONDS
+    )
+    with _bedrock_rate_lock:
+        _bedrock_next_allowed_at = max(_bedrock_next_allowed_at, time.monotonic() + backoff)
+    return backoff
+
+
+def _is_daily_quota_throttle(message: str) -> bool:
+    """Detect account-level token caps that require waiting for quota reset."""
+    msg = (message or "").lower()
+    return "per day" in msg or "daily" in msg
 
 
 def get_bedrock_client():
     """Create a Bedrock runtime client once, re-use it."""
     global _bedrock_client
     if _bedrock_client is None:
-        region = os.getenv("AWS_REGION", "us-east-1")
+        region = os.getenv("AWS_REGION", "us-east-2")
         _bedrock_client = boto3.client(
             "bedrock-runtime",
             region_name=region,
@@ -310,6 +419,16 @@ def get_bedrock_client():
 
 
 def extract_job_status_claude(subject, body_snippet, platform="other", sender="", force_model_id=None):
+    global _bedrock_daily_quota_exhausted
+    if _bedrock_daily_quota_exhausted:
+        return {
+            "relevant": False,
+            "reason": "Bedrock daily token quota exhausted",
+            "jobs": [],
+            "error": "Daily token quota exhausted",
+            "_stop_processing": True,
+        }
+
     prompt = f"""
 You are a filter and parser for job application emails.
 First, decide if this email is about a job (application, interview, offer, rejection, recruiter outreach, etc.).
@@ -341,10 +460,11 @@ Only output the JSON object.
     llm_start = time.time()
     client = get_bedrock_client()
     model_id = force_model_id or choose_model(subject, body_snippet, sender=sender, platform=platform)
-    print(f"[Bedrock] using model={model_id}")
+    current_model_id = model_id
+    print(f"[Bedrock] using model={current_model_id}")
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 400,
+        "max_tokens": BEDROCK_MAX_OUTPUT_TOKENS,
         "temperature": 0,
         "messages": [
             {
@@ -356,12 +476,11 @@ Only output the JSON object.
         ],
     }
 
-    for attempt in range(4):  # simple retry for throttling
+    for attempt in range(BEDROCK_MAX_ATTEMPTS):
         try:
-            # Slightly longer pause to reduce throttling
-            time.sleep(3.0 + random.random() * 2.0)  # 3-5s between calls
+            _wait_for_bedrock_slot()
             response = client.invoke_model(
-                modelId=model_id,
+                modelId=current_model_id,
                 body=json.dumps(payload).encode("utf-8"),
                 contentType="application/json",
                 accept="application/json",
@@ -383,20 +502,67 @@ Only output the JSON object.
                 print("Warning: Couldn't parse JSON from LLM response (payload suppressed).")
                 data = {"company": "", "job_title": "", "status": "", "date": "", "relevant": False, "reason": "Parsing failed", "error": str(e)}
             elapsed = time.time() - llm_start
-            print(f"[Bedrock] success model={model_id} time={elapsed:.2f}s")
-            log_event("bedrock_success", model=model_id, elapsed_s=elapsed)
+            print(f"[Bedrock] success model={current_model_id} time={elapsed:.2f}s")
+            log_event("bedrock_success", model=current_model_id, elapsed_s=elapsed)
             if isinstance(data, dict):
-                data["_model_id"] = model_id
+                data["_model_id"] = current_model_id
             return data
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             msg = e.response.get("Error", {}).get("Message", "")
             req_id = e.response.get("ResponseMetadata", {}).get("RequestId", "")
-            print(f"[Bedrock] attempt {attempt+1} failed: code={code} msg={msg} req_id={req_id}")
-            log_event("bedrock_error", attempt=attempt + 1, code=code, msg=msg, req_id=req_id)
-            if code == "ThrottlingException" and attempt < 3:
-                # exponential-ish backoff with jitter
-                time.sleep(4.0 * (attempt + 1) + random.random() * 2.0)  # 4/8/12s-ish
+            print(
+                f"[Bedrock] attempt {attempt+1} failed: model={current_model_id} "
+                f"code={code} msg={msg} req_id={req_id}"
+            )
+            log_event(
+                "bedrock_error",
+                attempt=attempt + 1,
+                model=current_model_id,
+                code=code,
+                msg=msg,
+                req_id=req_id,
+            )
+            is_throttle = code == "ThrottlingException"
+            is_token_throttle = is_throttle and "token" in (msg or "").lower()
+            is_daily_quota = is_token_throttle and _is_daily_quota_throttle(msg)
+            if is_daily_quota:
+                _bedrock_daily_quota_exhausted = True
+                log_event(
+                    "bedrock_daily_quota_exhausted",
+                    model=current_model_id,
+                    msg=msg,
+                    req_id=req_id,
+                )
+                return {
+                    "relevant": False,
+                    "reason": "Bedrock daily token quota exhausted",
+                    "jobs": [],
+                    "error": "Daily token quota exhausted",
+                    "_stop_processing": True,
+                }
+            if (
+                is_token_throttle
+                and current_model_id == SONNET_ID
+                and BEDROCK_SONNET_TOKEN_THROTTLE_SWITCH
+            ):
+                current_model_id = HAIKU_ID
+                print("[Bedrock] token throttle on Sonnet; switching to Haiku")
+                log_event(
+                    "bedrock_model_switch",
+                    from_model=SONNET_ID,
+                    to_model=HAIKU_ID,
+                    reason="token_throttle",
+                )
+            if is_throttle and attempt < BEDROCK_MAX_ATTEMPTS - 1:
+                backoff_s = _extend_bedrock_backoff(attempt)
+                print(f"[Bedrock] throttled; backing off for {backoff_s:.1f}s")
+                log_event(
+                    "bedrock_backoff",
+                    attempt=attempt + 1,
+                    model=current_model_id,
+                    backoff_s=round(backoff_s, 3),
+                )
                 continue
             break
         except Exception as e:
@@ -428,9 +594,13 @@ SONNET_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 
 def choose_model(subject: str, body_snippet: str, sender: str = "", platform: str = "") -> str:
     """
-    Send easy/short/obvious emails to Haiku, tougher ones to Sonnet.
-    Always route LinkedIn/Greenhouse to Sonnet.
+    Prefer Haiku by default to avoid Bedrock token throttling.
+    Sonnet is opt-in via BEDROCK_ENABLE_SONNET=1 for harder/noisy emails.
     """
+    if BEDROCK_MODEL_OVERRIDE:
+        return BEDROCK_MODEL_OVERRIDE
+    if not BEDROCK_ENABLE_SONNET:
+        return HAIKU_ID
     s = (sender or "").lower()
     if "linkedin.com" in s or "greenhouse.io" in s:
         return SONNET_ID
@@ -441,11 +611,12 @@ def choose_model(subject: str, body_snippet: str, sender: str = "", platform: st
     text = subj + " " + body
     job_words = ("job", "application", "applied", "interview", "offer", "position", "role", "recruit", "hiring")
     has_job_word = any(w in text for w in job_words)
-    is_long = len(body) > 1000  # modest threshold to route some to Sonnet
-    has_many_lines = body.count("\n") > 8
+    is_very_long = len(body) > 1600
+    has_many_lines = body.count("\n") > 20
     looks_weird = "unsubscribe" in text or "newsletter" in text
-    # Send Sonnet if it looks long/noisy/ambiguous; otherwise Haiku.
-    return SONNET_ID if (is_long or has_many_lines or (not has_job_word) or looks_weird) else HAIKU_ID
+    low_signal = (not has_job_word) and len(subj) > 80
+    # Sonnet only for high-complexity cases when explicitly enabled.
+    return SONNET_ID if (is_very_long and (has_many_lines or low_signal or looks_weird)) else HAIKU_ID
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
@@ -554,7 +725,11 @@ def process_email(mail, idx):
                     return False
             return True
 
-        if llm_result.get("_model_id") != SONNET_ID and titles_missing(llm_result):
+        if (
+            BEDROCK_ENABLE_SONNET
+            and llm_result.get("_model_id") != SONNET_ID
+            and titles_missing(llm_result)
+        ):
             llm_result = extract_job_status_claude(
                 mail.get('subject_trimmed', mail.get('subject', '')),
                 mail.get('body_snippet', mail.get('body', '')),
@@ -579,9 +754,19 @@ def process_email(mail, idx):
 
 
 def main():
+    global _bedrock_daily_quota_exhausted
+    _bedrock_daily_quota_exhausted = False
+
     blacklist_keywords = load_blacklist()
     service = authenticate_gmail()
     conn = get_conn()
+    backfill_status_and_reason(conn)
+    print(
+        "Bedrock config: "
+        f"AWS_REGION={os.getenv('AWS_REGION', 'us-east-1')} "
+        f"model_override={BEDROCK_MODEL_OVERRIDE or '(none)'} "
+        f"enable_sonnet={BEDROCK_ENABLE_SONNET}"
+    )
 
     # Read the most recent processed ID (if any) so we can stop when we reach it
     last_id = None
@@ -595,20 +780,25 @@ def main():
     else:
         print("No last_processed_id.txt found; will process all fetched emails.")
 
-    # Keep fetch size aligned with the intended batch size; resume from stored page token if present
+    # Keep fetch size aligned with the intended batch size.
+    # By default we always start from page 1 so new emails are picked up every run.
+    # Set GMAIL_RESUME_OLDER_PAGES=1 only when intentionally backfilling older pages.
     start_page_token = None
     token_path = "next_page_token.txt"
-    if os.path.exists(token_path):
+    if GMAIL_RESUME_OLDER_PAGES and os.path.exists(token_path):
         with open(token_path, "r") as f:
             start_page_token = f.read().strip() or None
         if start_page_token:
-            print(f"Resuming from stored page token.")
+            print("Resuming from stored page token (older-page backfill mode).")
+    elif os.path.exists(token_path):
+        print("Ignoring stored page token to prioritize newest emails.")
 
     emails, new_page_token = get_job_emails(service, max_total=20, start_page_token=start_page_token)
 
     existing_ids = load_existing_ids(conn)
 
     emails_to_process = []
+    checkpoint_id = None
     skipped_dupe = 0
     skipped_thread_replaced = 0
     skipped_blacklist = 0
@@ -620,6 +810,8 @@ def main():
         if last_id and mail['id'] == last_id:
             print("Reached last processed email. Stopping this batch.")
             break
+        # Track the oldest newly-seen message so progress is saved even on parse failures.
+        checkpoint_id = mail["id"]
         # Skip already-processed emails
         if mail['id'] in existing_ids:
             skipped_dupe += 1
@@ -650,80 +842,87 @@ def main():
     start_all = time.time()
     skipped_not_relevant = 0
     error_counts = {}
-    with ThreadPoolExecutor(max_workers=1) as executor:  # adjust concurrency
-        future_to_idx = {executor.submit(process_email, mail, idx): idx for mail, idx in emails_to_process}
-        for future in as_completed(future_to_idx):
-            idx, mail, llm_result = future.result()
-            if not llm_result.get("relevant", True):
-                skipped_not_relevant += 1
-                key = llm_result.get("error") or llm_result.get("reason") or "not_relevant"
-                error_counts[key] = error_counts.get(key, 0) + 1
-                continue
-            jobs = llm_result.get("jobs", [])
-            if not isinstance(jobs, list):
-                jobs = []
-            # Backward-compat: if single fields came back, wrap them as one job
-            if not jobs and any(llm_result.get(k) for k in ("company", "job_title", "status")):
-                jobs = [{
-                    "company": llm_result.get("company", ""),
-                    "job_title": llm_result.get("job_title", ""),
-                    "status": llm_result.get("status", ""),
-                    "date": llm_result.get("date", ""),
-                }]
-            applications = []
-            for job in jobs:
-                cleaned_company = clean_company(job.get("company", ""), mail.get("from", ""))
-                cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
-                if not cleaned_company or cleaned_company.lower() == "unknown":
-                    continue
-                if not cleaned_title:
-                    inferred = infer_title_from_subject(mail.get("subject", ""), cleaned_company)
-                    cleaned_title = clean_job_title(inferred, mail.get("from", ""))
-                review_note = ""
-                if not cleaned_title:
-                    cleaned_title = "(unknown title - review)"
-                    review_note = "missing_title"
-                parsed_date = job.get("date", "") or to_iso_date(mail.get("date", ""))
-                reason = llm_result.get("reason", "") or review_note
-                if review_note and llm_result.get("reason"):
-                    reason = f"{llm_result.get('reason')} | {review_note}"
-                applications.append(
-                    {
-                        "company": cleaned_company,
-                        "job_title": cleaned_title,
-                        "status": clean_status(job.get("status", "")),
-                        "parsed_date": parsed_date,
-                        "reason": reason,
-                        "error": llm_result.get("error", ""),
-                    }
-                )
-            key = llm_result.get("error") or "ok"
+    stopped_for_daily_quota = False
+    for mail, idx in emails_to_process:
+        idx, mail, llm_result = process_email(mail, idx)
+        if llm_result.get("_stop_processing"):
+            stopped_for_daily_quota = True
+            print("Bedrock daily token quota hit; stopping this run without advancing progress markers.")
+            key = llm_result.get("error") or "Daily token quota exhausted"
             error_counts[key] = error_counts.get(key, 0) + 1
-            if not applications:
+            break
+        if not llm_result.get("relevant", True):
+            skipped_not_relevant += 1
+            key = llm_result.get("error") or llm_result.get("reason") or "not_relevant"
+            error_counts[key] = error_counts.get(key, 0) + 1
+            continue
+        jobs = llm_result.get("jobs", [])
+        if not isinstance(jobs, list):
+            jobs = []
+        # Backward-compat: if single fields came back, wrap them as one job
+        if not jobs and any(llm_result.get(k) for k in ("company", "job_title", "status")):
+            jobs = [{
+                "company": llm_result.get("company", ""),
+                "job_title": llm_result.get("job_title", ""),
+                "status": llm_result.get("status", ""),
+                "date": llm_result.get("date", ""),
+            }]
+        applications = []
+        for job in jobs:
+            cleaned_company = clean_company(job.get("company", ""), mail.get("from", ""))
+            cleaned_title = clean_job_title(job.get("job_title", ""), mail.get("from", ""))
+            if not cleaned_company or cleaned_company.lower() == "unknown":
                 continue
-            row = {
-                "id": mail['id'],
-                "email_num": idx,
-                "thread_id": mail.get("thread_id", ""),
-                "subject": mail['subject'],
-                "from": mail['from'],
-                "date_email": mail['date'],
-                "date_email_iso": to_iso_date(mail['date']),
-                # Keep first job on the email row for compatibility; applications table is canonical
-                "company": applications[0]["company"] if applications else "",
-                "job_title": applications[0]["job_title"] if applications else "",
-                "status": applications[0]["status"] if applications else "",
-                "parsed_date": applications[0]["parsed_date"] if applications else "",
-                "reason": llm_result.get("reason", ""),
-                "error": llm_result.get("error", ""),
-                "applications": applications,
-            }
-            output_rows.append(row)
-            existing_ids.add(mail['id'])
-            # Pause slightly longer between emails to reduce throttling
-            time.sleep(6.0 + random.random() * 2.0)  # 6-8s pacing to ease throttling
-            if idx % 10 == 0:
-                print(f"Processed {idx} emails out of {len(emails_to_process)}")
+            if not cleaned_title:
+                inferred = infer_title_from_subject(mail.get("subject", ""), cleaned_company)
+                cleaned_title = clean_job_title(inferred, mail.get("from", ""))
+            review_note = ""
+            if not cleaned_title:
+                cleaned_title = "(unknown title - review)"
+                review_note = "missing_title"
+            parsed_date = job.get("date", "") or to_iso_date(mail.get("date", ""))
+            reason_raw = llm_result.get("reason", "") or review_note
+            if review_note and llm_result.get("reason"):
+                reason_raw = f"{llm_result.get('reason')} | {review_note}"
+            status_normalized = clean_status(job.get("status", ""))
+            reason_normalized = clean_reason(reason_raw, status_normalized)
+            applications.append(
+                {
+                    "company": cleaned_company,
+                    "job_title": cleaned_title,
+                    "status": status_normalized,
+                    "parsed_date": parsed_date,
+                    "reason": reason_normalized,
+                    "error": llm_result.get("error", ""),
+                }
+            )
+        key = llm_result.get("error") or "ok"
+        error_counts[key] = error_counts.get(key, 0) + 1
+        if not applications:
+            continue
+        row = {
+            "id": mail['id'],
+            "email_num": idx,
+            "thread_id": mail.get("thread_id", ""),
+            "subject": mail['subject'],
+            "from": mail['from'],
+            "date_email": mail['date'],
+            "date_email_iso": to_iso_date(mail['date']),
+            # Keep first job on the email row for compatibility; applications table is canonical
+            "company": applications[0]["company"] if applications else "",
+            "job_title": applications[0]["job_title"] if applications else "",
+            "status": applications[0]["status"] if applications else "",
+            "parsed_date": applications[0]["parsed_date"] if applications else "",
+            "reason": applications[0]["reason"] if applications else "",
+            "error": llm_result.get("error", ""),
+            "applications": applications,
+        }
+        output_rows.append(row)
+        existing_ids.add(mail['id'])
+        # Pause slightly longer between emails to reduce throttling.
+        time.sleep(6.0 + random.random() * 2.0)  # 6-8s pacing to ease throttling
+        if idx % 10 == 0:
+            print(f"Processed {idx} emails out of {len(emails_to_process)}")
     print(f"All LLM processing done in {time.time() - start_all:.2f} seconds.")
   #  print("CWD:", os.getcwd())
   #  print("Rows to write:", len(output_rows))
@@ -733,20 +932,33 @@ def main():
     if output_rows:
         save_rows(conn, output_rows)
         print(f"Saved {len(output_rows)} rows into {DB_PATH}")
-        # Persist the oldest email ID in this batch so next run skips down to it
-        oldest_id = emails_to_process[-1][0]['id'] if emails_to_process else None
-        if oldest_id:
-            with open("last_processed_id.txt", "w") as f:
-                f.write(oldest_id)
-            print(f"Saved oldest processed email ID: {oldest_id}")
     else:
         print("No new rows to save to the database.")
 
+    if stopped_for_daily_quota:
+        print("Kept last_processed_id.txt unchanged because quota was exhausted mid-run.")
+    elif checkpoint_id:
+        with open("last_processed_id.txt", "w") as f:
+            f.write(checkpoint_id)
+        print(f"Saved last processed email ID: {checkpoint_id}")
+    elif last_id:
+        print("No newer emails found; keeping existing last_processed_id.txt value.")
+
     # Persist the next page token (if any) so next run can resume deeper
+    if stopped_for_daily_quota:
+        token_to_save = start_page_token
+    elif GMAIL_RESUME_OLDER_PAGES:
+        token_to_save = new_page_token
+    else:
+        token_to_save = ""
     with open(token_path, "w") as f:
-        f.write(new_page_token or "")
-    if new_page_token:
+        f.write(token_to_save or "")
+    if stopped_for_daily_quota and start_page_token:
+        print("Kept existing page token so the same batch can resume after quota resets.")
+    elif token_to_save:
         print("Saved next page token for next run.")
+    elif not GMAIL_RESUME_OLDER_PAGES:
+        print("Cleared page token (incremental newest-first mode).")
     else:
         print("No next page token; reached end of available pages for this query.")
 
@@ -762,5 +974,59 @@ def main():
         f"LLM skipped {skipped_not_relevant}; "
         f"saved {len(output_rows)}"
     )
+    return {
+        "stopped_for_daily_quota": stopped_for_daily_quota,
+        "saved_rows": len(output_rows),
+    }
+
+
+def run_with_auto_wait():
+    """Optionally sleep-and-retry when daily token quota is exhausted."""
+    wait_cycle = 0
+    while True:
+        result = main()
+        if not result.get("stopped_for_daily_quota", False):
+            break
+        if not BEDROCK_AUTO_WAIT_ON_DAILY_QUOTA:
+            print("Auto-wait disabled; exiting after daily quota exhaustion.")
+            break
+        wait_cycle += 1
+        if wait_cycle > BEDROCK_DAILY_QUOTA_MAX_WAIT_CYCLES:
+            print(
+                "Reached max auto-wait cycles; exiting without more retries."
+            )
+            log_event(
+                "bedrock_daily_quota_wait_limit_reached",
+                max_cycles=BEDROCK_DAILY_QUOTA_MAX_WAIT_CYCLES,
+            )
+            break
+        jitter = random.uniform(0, min(120, BEDROCK_DAILY_QUOTA_WAIT_SECONDS * 0.1))
+        sleep_s = BEDROCK_DAILY_QUOTA_WAIT_SECONDS + jitter
+        print(
+            f"Daily quota exhausted. Auto-wait sleeping for {sleep_s:.0f}s "
+            f"(cycle {wait_cycle}/{BEDROCK_DAILY_QUOTA_MAX_WAIT_CYCLES})."
+        )
+        log_event(
+            "bedrock_daily_quota_wait",
+            cycle=wait_cycle,
+            sleep_s=round(sleep_s, 3),
+            max_cycles=BEDROCK_DAILY_QUOTA_MAX_WAIT_CYCLES,
+        )
+        time.sleep(sleep_s)
+
+
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Parse Gmail job emails into SQLite.")
+    parser.add_argument(
+        "--backfill-only",
+        action="store_true",
+        help="Normalize existing status/reason fields in SQLite without calling Gmail/Bedrock.",
+    )
+    args = parser.parse_args()
+
+    if args.backfill_only:
+        conn = get_conn()
+        backfill_status_and_reason(conn)
+        print("Backfill complete.")
+    else:
+        run_with_auto_wait()
