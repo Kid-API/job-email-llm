@@ -591,16 +591,10 @@ def main():
     else:
         print("No last_processed_id.txt found; will process all fetched emails.")
 
-    # Keep fetch size aligned with the intended batch size; resume from stored page token if present
-    start_page_token = None
+    # Always start from page 1 so new emails (which appear at the top) are never skipped.
+    # next_page_token.txt is kept on disk for manual backfill runs only — do not load it here.
     token_path = "next_page_token.txt"
-    if os.path.exists(token_path):
-        with open(token_path, "r") as f:
-            start_page_token = f.read().strip() or None
-        if start_page_token:
-            print(f"Resuming from stored page token.")
-
-    emails, new_page_token = get_job_emails(service, max_total=20, start_page_token=start_page_token)
+    emails, new_page_token = get_job_emails(service, max_total=20)
 
     existing_ids = load_existing_ids(conn)
 
