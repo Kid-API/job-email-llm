@@ -419,8 +419,8 @@ job_like_keywords = [
     "recruit", "recruiter", "opening"
 ]
 
-HAIKU_ID = "anthropic.claude-3-haiku-20240307-v1:0"
-SONNET_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
+HAIKU_ID = "anthropic.claude-3-5-haiku-20241022-v1:0"
+SONNET_ID = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 
 def choose_model(subject: str, body_snippet: str, sender: str = "", platform: str = "") -> str:
     """
